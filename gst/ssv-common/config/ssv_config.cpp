@@ -503,6 +503,43 @@ void validate_indexing_extension(const YAML::Node &node)
         node, "embedding_model", "agent.indexing.embedding_model");
 }
 
+void validate_knowledge_extension(const YAML::Node &node)
+{
+    constexpr std::string_view path = "agent.knowledge";
+    require_map(node, path);
+    reject_unknown_keys(node, path, {
+        "backend",
+        "qdrant_path",
+        "min_score",
+    });
+
+    const auto backend = get_or<std::string>(
+        node, "backend", "local_markdown", "agent.knowledge.backend");
+    if (backend != "local_markdown"
+        && backend != "qdrant"
+        && backend != "mock") {
+        throw_invalid_value(
+            "agent.knowledge.backend",
+            "agent.knowledge.backend is not supported");
+    }
+
+    const auto qdrant_path = get_or<std::string>(
+        node, "qdrant_path", "data/qdrant", "agent.knowledge.qdrant_path");
+    if (is_blank(qdrant_path)) {
+        throw_invalid_value(
+            "agent.knowledge.qdrant_path",
+            "agent.knowledge.qdrant_path must not be blank");
+    }
+
+    const auto min_score = get_or<float>(
+        node, "min_score", 0.5F, "agent.knowledge.min_score");
+    if (!std::isfinite(min_score) || min_score < -1.0F || min_score > 1.0F) {
+        throw_invalid_value(
+            "agent.knowledge.min_score",
+            "agent.knowledge.min_score must be between -1 and 1");
+    }
+}
+
 void validate_agent_extensions(const YAML::Node &agent)
 {
     if (const auto evidence_roots = agent["evidence_roots"]) {
@@ -523,6 +560,8 @@ void validate_agent_extensions(const YAML::Node &agent)
         validate_review_extension(review);
     if (const auto indexing = agent["indexing"])
         validate_indexing_extension(indexing);
+    if (const auto knowledge = agent["knowledge"])
+        validate_knowledge_extension(knowledge);
 }
 
 std::string format_log_value(std::string_view value)
@@ -1387,6 +1426,7 @@ SsvConfig parse_and_validate(const YAML::Node &root)
                 "evidence_roots",
                 "review",
                 "indexing",
+                "knowledge",
             });
         config.agent.state_machine_timeout = get_or<int>(
             agent,

@@ -121,6 +121,30 @@ agent:
     assert cfg.agent.indexing.embedding_model == "/models/bge-m3"
 
 
+def test_knowledge_config_has_safe_defaults_and_validates_threshold() -> None:
+    defaults = SsvConfig().agent.knowledge
+    assert defaults.backend == "local_markdown"
+    assert defaults.qdrant_path == "data/qdrant"
+    assert defaults.min_score == 0.5
+
+    configured = SsvConfig.model_validate(
+        {
+            "agent": {
+                "knowledge": {
+                    "backend": "qdrant",
+                    "qdrant_path": "/var/lib/ssv/qdrant",
+                    "min_score": 0.65,
+                }
+            }
+        }
+    )
+    assert configured.agent.knowledge.backend == "qdrant"
+    assert configured.agent.knowledge.min_score == 0.65
+
+    with pytest.raises(ValidationError):
+        SsvConfig.model_validate({"agent": {"knowledge": {"min_score": 1.1}}})
+
+
 def test_load_config_applies_environment_overrides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

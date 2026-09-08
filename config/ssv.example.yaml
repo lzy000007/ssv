@@ -138,3 +138,8 @@ agent:
     embedding_model: null
     # 离线 BGE-M3 示例：embedding_backend: "bge_m3"
     # embedding_model: "/opt/models/bge-m3"
+  # 规则默认使用本地词法检索；切换为 qdrant 前必须完成规则入库并配置真实 embedding。
+  knowledge:
+    backend: "local_markdown"
+    qdrant_path: "data/qdrant"
+    min_score: 0.5

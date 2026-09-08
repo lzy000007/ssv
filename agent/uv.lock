@@ -4514,6 +4514,8 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "deerflow-harness" },
+    { name = "langchain" },
+    { name = "openai" },
     { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
@@ -4535,7 +4537,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "deerflow-harness", editable = "third_party/deer-flow/backend/packages/harness" },
+    { name = "langchain", specifier = ">=1.3" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
+    { name = "openai", specifier = ">=1.0" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "python-dotenv", specifier = ">=1.0" },

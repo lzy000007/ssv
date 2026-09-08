@@ -21,7 +21,11 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
         base_url: str | None = None,
         api_key: str | None = None,
     ) -> None:
-        self._model = model or os.getenv("SSV_EMBEDDING_MODEL", "text-embedding-3-small")
+        self._model: str = (
+            model
+            if model is not None
+            else os.getenv("SSV_EMBEDDING_MODEL") or "text-embedding-3-small"
+        )
         self._client = AsyncOpenAI(
             api_key=api_key or os.getenv("SSV_EMBEDDING_API_KEY"),
             base_url=base_url or os.getenv("SSV_EMBEDDING_BASE_URL"),
@@ -32,7 +36,17 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
         return [item.embedding for item in response.data]
 
     async def embed_query(self, query: str) -> list[float]:
-        vectors = await self.embed_texts([query])
+        response = await self._client.embeddings.create(
+            model=self._model,
+            input=[query],
+            extra_body={"text_type": "query"},
+        )
+        vectors = [item.embedding for item in response.data]
+        if len(vectors) != 1:
+            raise ValueError(
+                "embedding provider returned an unexpected number of query vectors: "
+                f"expected=1, actual={len(vectors)}"
+            )
         return vectors[0]
 
 

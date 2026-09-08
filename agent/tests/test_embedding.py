@@ -32,6 +32,35 @@ def test_embedding_identity_uses_effective_backend_defaults(monkeypatch) -> None
     assert openai.model == "text-embedding-3-small"
 
 
+def test_openai_embedding_identity_includes_endpoint(monkeypatch) -> None:
+    monkeypatch.delenv("SSV_EMBEDDING_MODEL", raising=False)
+    monkeypatch.setenv("SSV_EMBEDDING_BASE_URL", "https://one.example/v1")
+    first = resolve_embedding_identity("openai_compatible")
+
+    monkeypatch.setenv("SSV_EMBEDDING_BASE_URL", "https://two.example/v1")
+    second = resolve_embedding_identity("openai_compatible")
+
+    assert first.endpoint == "https://one.example/v1"
+    assert second.endpoint == "https://two.example/v1"
+    assert first != second
+
+
+def test_mapping_embedding_identity_preserves_endpoint() -> None:
+    from ssv_agent.event_store.qdrant_store import derive_physical_collection_name
+
+    common = {"schema_version": 1, "backend": "openai_compatible", "model": "model"}
+    first = derive_physical_collection_name(
+        "rules",
+        {**common, "endpoint": "https://one.example/v1"},
+    )
+    second = derive_physical_collection_name(
+        "rules",
+        {**common, "endpoint": "https://two.example/v1"},
+    )
+
+    assert first != second
+
+
 def test_mock_embedding_identity_is_versioned_and_ignores_model_environment(
     monkeypatch,
 ) -> None:
@@ -157,8 +186,8 @@ def test_configured_openai_provider_maps_model(monkeypatch) -> None:
     calls: list[tuple[str, list[str]]] = []
 
     class FakeEmbeddings:
-        async def create(self, *, model: str, input: list[str]):
-            calls.append((model, input))
+        async def create(self, *, model: str, input: list[str], extra_body=None):
+            calls.append((model, input, extra_body))
             return SimpleNamespace(
                 data=[SimpleNamespace(embedding=[0.1, 0.2]) for _ in input]
             )
@@ -175,7 +204,9 @@ def test_configured_openai_provider_maps_model(monkeypatch) -> None:
     provider = get_configured_provider("openai_compatible", "embedding-model-v2")
 
     assert asyncio.run(provider.embed_query("query")) == [0.1, 0.2]
-    assert calls == [("embedding-model-v2", ["query"])]
+    assert calls == [
+        ("embedding-model-v2", ["query"], {"text_type": "query"}),
+    ]
 
 
 def test_configured_mock_provider_does_not_receive_model_parameter() -> None:

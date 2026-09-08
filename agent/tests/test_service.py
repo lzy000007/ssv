@@ -311,6 +311,9 @@ def test_indexing_uses_same_embedding_settings_as_search_environment(monkeypatch
     monkeypatch.setenv("SSV_EMBEDDING_BACKEND", "operator-backend")
     monkeypatch.setenv("SSV_EMBEDDING_MODEL", "operator-model")
     monkeypatch.setenv("SSV_EVIDENCE_ROOTS", '["/operator/evidence"]')
+    monkeypatch.delenv("SSV_KNOWLEDGE_BACKEND", raising=False)
+    monkeypatch.delenv("SSV_QDRANT_PATH", raising=False)
+    monkeypatch.delenv("SSV_KNOWLEDGE_MIN_SCORE", raising=False)
     cfg = SsvConfig.model_validate(
         {
             "agent": {
@@ -319,7 +322,12 @@ def test_indexing_uses_same_embedding_settings_as_search_environment(monkeypatch
                     "enabled": True,
                     "embedding_backend": "bge_m3",
                     "embedding_model": "/models/bge-m3",
-                }
+                },
+                "knowledge": {
+                    "backend": "qdrant",
+                    "qdrant_path": "custom/qdrant",
+                    "min_score": 0.65,
+                },
             }
         }
     )
@@ -336,6 +344,9 @@ def test_indexing_uses_same_embedding_settings_as_search_environment(monkeypatch
                     os.environ["SSV_EMBEDDING_BACKEND"],
                     os.environ["SSV_EMBEDDING_MODEL"],
                     os.environ["SSV_EVIDENCE_ROOTS"],
+                    os.environ["SSV_KNOWLEDGE_BACKEND"],
+                    os.environ["SSV_QDRANT_PATH"],
+                    os.environ["SSV_KNOWLEDGE_MIN_SCORE"],
                 )
             }
         )
@@ -350,6 +361,9 @@ def test_indexing_uses_same_embedding_settings_as_search_environment(monkeypatch
         "bge_m3",
         "/models/bge-m3",
         '["/configured/evidence"]',
+        "qdrant",
+        str(service._agent_root() / "custom/qdrant"),
+        "0.65",
     )
     assert os.environ["SSV_EMBEDDING_BACKEND"] == "operator-backend"
     assert os.environ["SSV_EMBEDDING_MODEL"] == "operator-model"

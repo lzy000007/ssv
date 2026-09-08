@@ -10,6 +10,8 @@ dependencies = [
     "redis>=5.0,<8",
     "python-dotenv>=1.0",
     "deerflow-harness",
+    "langchain>=1.3",
+    "openai>=1.0",
     "qdrant-client>=1.9",
 ]
 

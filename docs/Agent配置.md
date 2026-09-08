@@ -154,21 +154,65 @@ SSV_EMBEDDING_API_KEY=replace-me
 SSV_EMBEDDING_BASE_URL=https://api.example.com/v1
 ```
 
+规则向量 RAG 与事件语义索引复用 `agent.indexing.embedding_backend` 和
+`agent.indexing.embedding_model`，避免入库和查询使用不同模型。`mock` 只用于测试，不能
+用于 Qdrant 规则 RAG。
+
 Agent 的持久化默认位置和覆盖变量：
 
 | 默认位置 | 环境变量 | 内容 |
 | --- | --- | --- |
 | `data/events.db` | `SSV_EVENT_DB_PATH` | SQLite EventLedger |
-| `data/qdrant` | `SSV_QDRANT_PATH` | 本地 Qdrant |
+| `agent/data/qdrant` | `SSV_QDRANT_PATH` | 本地 Qdrant |
 | `outputs` | `SSV_OUTPUTS_DIR` | 复核 JSON 结果 |
 | 本地 Qdrant | `SSV_QDRANT_URL` | 设置后改用 Qdrant 服务 |
 | Qdrant 服务 | `SSV_QDRANT_API_KEY` | 服务认证凭据 |
 
-表中的相对路径相对于 Agent 进程工作目录解析；`uv run ./ssv agent` 通常在 `agent/` 目录启动，因此默认文件通常位于 `agent/data/` 和 `agent/outputs/`。
+Qdrant 默认路径固定为 Agent 项目下的 `agent/data/qdrant`，不随当前工作目录变化；设置
+`SSV_QDRANT_PATH` 时可使用绝对路径。其他表中相对路径仍相对于 Agent 进程工作目录解析。
 
 Qdrant 只保存可重建的语义索引。embedding backend、model 或 schema 变化会产生新的物理 collection 身份；切换模型后需要重新入队 index job，不要把不同模型的向量混写。
 
-规则检索当前仍使用带来源的 mock backend，不能当作已经接入生产规则/SOP 知识库。
+## 规则知识检索
+
+`rule_retriever` 默认使用 `local_markdown` 后端，读取 `agent/knowledge/` 下的 `.md`、`.txt`
+规章文件。后端按编号条款切分内容，在内存中检索并最多返回两条带来源的规则片段；规章
+文件修改后会在下一次检索自动重建索引。
+
+当前已放入 `GB+26860-2011 (1).md`。如需临时使用原有固定样例，可在启动 Agent 前设置：
+
+```bash
+export SSV_KNOWLEDGE_BACKEND=mock
+```
+
+本地规章检索不依赖 Qdrant、embedding 或 index worker。
+
+需要使用 Qdrant 规则 RAG 时，在 `config/ssv.yaml` 中配置同一组 embedding 和知识后端：
+
+```yaml
+agent:
+  indexing:
+    embedding_backend: "bge_m3"
+    embedding_model: "/opt/models/bge-m3"
+  knowledge:
+    backend: "qdrant"
+    qdrant_path: "data/qdrant"
+    min_score: 0.5
+```
+
+`bge_m3` 需要先安装可选依赖，且模型目录必须已经存在。规则索引不会由 Agent 启动自动
+生成，首次使用或规章变更后执行：
+
+```bash
+cd agent
+uv sync --extra dev --extra bge-m3
+uv run --extra bge-m3 python -m ssv_agent.knowledge_ingest --config ../config/ssv.yaml
+```
+
+入库命令会按最多 20 条文本调用 embedding，成功后只保留当前规章对应的 chunk；规章目录
+为空会清空当前规则索引，目录不存在或 embedding 失败会返回错误。未创建或为空的 Qdrant
+索引会显式报告为不可用，不会返回随机条款。`min_score` 用于过滤低相似度结果，没有达到
+阈值时返回“无知识依据”。
 
 ## 运行时缓存与 Redis 运维
 

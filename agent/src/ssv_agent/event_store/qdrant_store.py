@@ -6,9 +6,9 @@ import hashlib
 import json
 import os
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from qdrant_client import QdrantClient, models
 
@@ -22,19 +22,22 @@ EmbeddingIdentityInput = EmbeddingIdentity | Mapping[str, object]
 
 
 def _default_qdrant_path() -> str:
-    """返回默认 Qdrant 本地路径：环境变量优先，其次 data/qdrant。"""
-    return os.getenv("SSV_QDRANT_PATH", "data/qdrant")
+    """返回默认 Qdrant 本地路径：环境变量优先，其次 Agent/data/qdrant。"""
+    configured = os.getenv("SSV_QDRANT_PATH")
+    if configured:
+        return configured
+    return str(Path(__file__).resolve().parents[3] / "data" / "qdrant")
 
 
 def _build_filter(filters: dict[str, Any] | None) -> models.Filter | None:
     """把简单的字段等值条件转成 Qdrant Filter。"""
     if not filters:
         return None
-    conditions = [
+    conditions: list[models.FieldCondition] = [
         models.FieldCondition(key=key, match=models.MatchValue(value=value))
         for key, value in filters.items()
     ]
-    return models.Filter(must=conditions)
+    return models.Filter(must=cast(Any, conditions))
 
 
 def _point_id(domain_id: str) -> str:
@@ -63,18 +66,22 @@ def _coerce_embedding_identity(identity: EmbeddingIdentityInput) -> EmbeddingIde
 
     algorithm = identity.get("algorithm")
     dimensions = identity.get("dimensions")
+    endpoint = identity.get("endpoint")
     if algorithm is not None and not isinstance(algorithm, str):
         raise ValueError("embedding_identity algorithm must be a string")
     if dimensions is not None and (
         not isinstance(dimensions, int) or isinstance(dimensions, bool) or dimensions <= 0
     ):
         raise ValueError("embedding_identity dimensions must be a positive integer")
+    if endpoint is not None and not isinstance(endpoint, str):
+        raise ValueError("embedding_identity endpoint must be a string")
     return EmbeddingIdentity(
         schema_version=schema_version,
         backend=backend,
         model=model,
         algorithm=algorithm,
         dimensions=dimensions,
+        endpoint=endpoint,
     )
 
 
@@ -164,21 +171,36 @@ class SsvQdrantStore:
     def ensure_collections(self, vector_size: int) -> None:
         """幂等创建事件与规则集合。"""
         for name in (self._event_collection, self._rule_collection):
-            if self._client.collection_exists(name):
-                actual_size = self._existing_vector_size(name)
-                if actual_size != vector_size:
-                    raise ValueError(
-                        f"Qdrant collection {name!r} vector size mismatch: "
-                        f"expected={vector_size}, actual={actual_size}"
-                    )
-                continue
-            self._client.create_collection(
-                collection_name=name,
-                vectors_config=models.VectorParams(
-                    size=vector_size,
-                    distance=models.Distance.COSINE,
-                ),
-            )
+            self.ensure_collection(name, vector_size)
+
+    def ensure_collection(self, collection_name: str, vector_size: int) -> None:
+        """幂等创建单个 collection，并检查向量维度。"""
+        if self._client.collection_exists(collection_name):
+            actual_size = self._existing_vector_size(collection_name)
+            if actual_size != vector_size:
+                raise ValueError(
+                    f"Qdrant collection {collection_name!r} vector size mismatch: "
+                    f"expected={vector_size}, actual={actual_size}"
+                )
+            return
+        self._client.create_collection(
+            collection_name=collection_name,
+            vectors_config=models.VectorParams(
+                size=vector_size,
+                distance=models.Distance.COSINE,
+            ),
+        )
+
+    def collection_exists(self, collection_name: str) -> bool:
+        """返回 collection 是否已创建。"""
+        return self._client.collection_exists(collection_name)
+
+    def count_points(self, collection_name: str) -> int:
+        """返回 collection 当前 point 数量；不存在时返回 0。"""
+        if not self.collection_exists(collection_name):
+            return 0
+        info = self._client.get_collection(collection_name)
+        return int(info.points_count or 0)
 
     def _existing_vector_size(self, collection_name: str) -> int:
         collection = self._client.get_collection(collection_name)
@@ -215,6 +237,46 @@ class SsvQdrantStore:
         payload = {**(payload or {}), "chunk_id": chunk_id}
         self._upsert(self._rule_collection, chunk_id, vector, payload)
 
+    def replace_rule_vectors(
+        self,
+        points: Sequence[tuple[str, list[float], dict[str, Any]]],
+    ) -> None:
+        """写入当前规则投影并删除不属于当前投影的旧 point。"""
+        if not points:
+            if self.collection_exists(self._rule_collection):
+                existing_ids = self._scroll_point_ids(self._rule_collection)
+                self._delete_points(self._rule_collection, existing_ids)
+            return
+
+        vector_size = len(points[0][1])
+        if vector_size <= 0:
+            raise ValueError("rule embedding vectors must not be empty")
+        if any(len(vector) != vector_size for _, vector, _ in points):
+            raise ValueError("rule embedding vectors must have a consistent dimension")
+        self.ensure_collection(self._rule_collection, vector_size)
+
+        desired_ids = {_point_id(chunk_id) for chunk_id, _, _ in points}
+        qdrant_points = [
+            models.PointStruct(
+                id=_point_id(chunk_id),
+                vector=vector,
+                payload={**payload, "chunk_id": chunk_id},
+            )
+            for chunk_id, vector, payload in points
+        ]
+        # 先写入完整的新投影，再删除旧 point；embedding 失败发生在调用本方法之前，
+        # 因而不会触碰现有索引。
+        self._client.upsert(
+            collection_name=self._rule_collection,
+            points=qdrant_points,
+            wait=True,
+        )
+        existing_ids = self._scroll_point_ids(self._rule_collection)
+        self._delete_points(
+            self._rule_collection,
+            [point_id for point_id in existing_ids if point_id not in desired_ids],
+        )
+
     def search_events(
         self,
         query_vector: list[float],
@@ -242,7 +304,7 @@ class SsvQdrantStore:
         vector: list[float],
         payload: dict[str, Any] | None,
     ) -> None:
-        self.ensure_collections(len(vector))
+        self.ensure_collection(collection, len(vector))
         point = models.PointStruct(
             id=_point_id(point_id),
             vector=vector,
@@ -260,7 +322,9 @@ class SsvQdrantStore:
         top_k: int,
         filters: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
-        self.ensure_collections(len(query_vector))
+        if not self.collection_exists(collection):
+            return []
+        self.ensure_collection(collection, len(query_vector))
         response = self._client.query_points(
             collection_name=collection,
             query=query_vector,
@@ -274,3 +338,31 @@ class SsvQdrantStore:
             item["score"] = hit.score
             hits.append(item)
         return hits
+
+    def _scroll_point_ids(self, collection_name: str) -> list[str | int | uuid.UUID]:
+        point_ids: list[str | int | uuid.UUID] = []
+        offset: str | int | uuid.UUID | None = None
+        while True:
+            records, offset = self._client.scroll(
+                collection_name=collection_name,
+                limit=1000,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            point_ids.extend(cast(str | int | uuid.UUID, record.id) for record in records)
+            if offset is None:
+                return point_ids
+
+    def _delete_points(
+        self,
+        collection_name: str,
+        point_ids: Sequence[str | int | uuid.UUID],
+    ) -> None:
+        if not point_ids:
+            return
+        self._client.delete(
+            collection_name=collection_name,
+            points_selector=models.PointIdsList(points=list(point_ids)),
+            wait=True,
+        )

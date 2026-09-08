@@ -63,6 +63,12 @@ def _embedding_settings(config: SsvConfig) -> tuple[str, str | None]:
     return indexing.embedding_backend, indexing.embedding_model
 
 
+def _resolve_agent_path(value: str) -> Path:
+    """把 Agent 配置中的路径解析到稳定的 Agent 项目目录。"""
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else _agent_root() / path
+
+
 def _close_resource(resource: object | None) -> None:
     close = getattr(resource, "close", None)
     if not callable(close):
@@ -340,6 +346,18 @@ class AgentService:
         backend, model = _embedding_settings(self._config)
         self._set_owned_environment("SSV_EMBEDDING_BACKEND", backend)
         self._set_owned_environment("SSV_EMBEDDING_MODEL", model)
+        knowledge = self._config.agent.knowledge
+        knowledge_backend = os.environ.get("SSV_KNOWLEDGE_BACKEND") or knowledge.backend
+        knowledge_path = os.environ.get("SSV_QDRANT_PATH") or knowledge.qdrant_path
+        knowledge_min_score = os.environ.get("SSV_KNOWLEDGE_MIN_SCORE") or str(
+            knowledge.min_score
+        )
+        self._set_owned_environment("SSV_KNOWLEDGE_BACKEND", knowledge_backend)
+        self._set_owned_environment(
+            "SSV_QDRANT_PATH",
+            str(_resolve_agent_path(knowledge_path).resolve()),
+        )
+        self._set_owned_environment("SSV_KNOWLEDGE_MIN_SCORE", knowledge_min_score)
         self._set_owned_environment(
             "SSV_EVIDENCE_ROOTS",
             json.dumps(self._config.agent.evidence_roots),

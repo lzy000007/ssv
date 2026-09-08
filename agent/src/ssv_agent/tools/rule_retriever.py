@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+from collections.abc import Coroutine
+from typing import Any
 
 from langchain.tools import tool
 
@@ -12,7 +15,17 @@ from ssv_agent.knowledge.registry import get_retriever
 
 
 def _knowledge_backend() -> str:
-    return os.getenv("SSV_KNOWLEDGE_BACKEND", "mock")
+    return os.getenv("SSV_KNOWLEDGE_BACKEND", "local_markdown")
+
+
+def _run_async(coroutine: Coroutine[Any, Any, Any]) -> Any:
+    """在同步工具中安全运行协程，包括调用方已有事件循环的情况。"""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coroutine)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ssv-rule-retriever") as executor:
+        return executor.submit(asyncio.run, coroutine).result()
 
 
 @tool("rule_retriever", parse_docstring=True)
@@ -34,7 +47,7 @@ def rule_retriever_tool(
     try:
         retriever = get_retriever(_knowledge_backend())
         filters = {"source": source} if source else None
-        result = asyncio.run(retriever.retrieve(query, top_k=top_k, filters=filters))
+        result = _run_async(retriever.retrieve(query, top_k=top_k, filters=filters))
         return result.model_dump_json()
     except Exception as exc:
         return json.dumps(
