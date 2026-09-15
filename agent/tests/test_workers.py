@@ -10,8 +10,12 @@ import ssv_agent.event_store.ledger as ledger_module
 import ssv_agent.workers as workers_module
 from ssv_agent.event_store import DurableJob, EventLedger, JobKind, JobState
 from ssv_agent.review_context import ReviewContext
+from ssv_agent.prompt import build_review_prompt
 from ssv_agent.result import ReviewResult
-from ssv_agent.workers import _LeaseHeartbeat, IndexWorker, ReviewWorker
+from ssv_agent.knowledge.schema import Chunk, RetrievalResult
+from ssv_agent.recording_evidence import RecordingEvidenceArtifact, RecordingEvidenceError
+from ssv_agent.config import RecordingEvidenceConfig
+from ssv_agent.workers import _LeaseHeartbeat, IndexWorker, ReviewWorker, RecordingEvidenceWorker
 
 
 @pytest.fixture(autouse=True)
@@ -50,6 +54,149 @@ def _requeue_claim_for_a_stricter_retry_limit(db_path: Path, kind: JobKind) -> N
             max_retries=3,
             retry_delay_ms=0,
         )
+
+
+def _record_recording_case(db_path: Path, root: Path) -> None:
+    with EventLedger(
+        db_path,
+        evidence_roots=[str(root)],
+        recording_evidence=RecordingEvidenceConfig(enabled=True),
+    ) as ledger:
+        ledger.record(
+            ReviewContext(
+                event_id="case-1",
+                ingress_id="1-0",
+                source="camera-1",
+                timestamp_ms=1000,
+                frame_id=4,
+            )
+        )
+
+
+def _recording_artifacts(root: Path) -> tuple[RecordingEvidenceArtifact, ...]:
+    derived = root / "derived" / "case-1"
+    derived.mkdir(parents=True)
+    artifacts = []
+    for kind, name, mime in [("clip", "context.mp4", "video/mp4"), ("frame", "frame-01.jpg", "image/jpeg"), ("frame", "frame-02.jpg", "image/jpeg"), ("frame", "frame-03.jpg", "image/jpeg")]:
+        path = derived / name
+        path.write_bytes(name.encode())
+        artifacts.append(RecordingEvidenceArtifact(kind=kind, path=path, sha256=__import__("hashlib").sha256(path.read_bytes()).hexdigest(), mime_type=mime, size=path.stat().st_size, mtime=path.stat().st_mtime))
+    return tuple(artifacts)
+
+
+def test_recording_worker_completes_extract_before_review_is_claimable(tmp_path: Path) -> None:
+    db_path = tmp_path / "events.db"
+    _record_recording_case(db_path, tmp_path)
+    calls: list[str] = []
+
+    class Extractor:
+        def extract(self, case):
+            calls.append(case.event_id)
+            return _recording_artifacts(tmp_path)
+
+    worker = RecordingEvidenceWorker(
+        ledger_factory=lambda: EventLedger(db_path, evidence_roots=[str(tmp_path)], recording_evidence=RecordingEvidenceConfig(enabled=True)),
+        extractor=Extractor(), worker_id="extract-test", lease_ms=1_000, max_retries=2, retry_delay_ms=0,
+    )
+    assert worker.run_once() is True
+    assert calls == ["case-1"]
+    with EventLedger(db_path, evidence_roots=[str(tmp_path)], recording_evidence=RecordingEvidenceConfig(enabled=True)) as ledger:
+        assert ledger.claim_job(JobKind.REVIEW, "review", 1000) is not None
+
+
+def test_recording_worker_marks_retryable_failure_and_does_not_extract_after_limit(tmp_path: Path) -> None:
+    db_path = tmp_path / "events.db"
+    _record_recording_case(db_path, tmp_path)
+    calls = 0
+
+    class Extractor:
+        def extract(self, case):
+            nonlocal calls
+            calls += 1
+            raise RecordingEvidenceError("window unavailable", retryable=True)
+
+    worker = RecordingEvidenceWorker(
+        ledger_factory=lambda: EventLedger(db_path, evidence_roots=[str(tmp_path)], recording_evidence=RecordingEvidenceConfig(enabled=True)),
+        extractor=Extractor(), worker_id="extract-test", lease_ms=1_000, max_retries=1, retry_delay_ms=0,
+    )
+    assert worker.run_once() is True
+    assert calls == 1
+
+
+def test_recording_worker_nonretryable_failure_marks_event_manual_review(tmp_path: Path) -> None:
+    db_path = tmp_path / "events.db"
+    _record_recording_case(db_path, tmp_path)
+
+    class Extractor:
+        def extract(self, case):
+            raise RecordingEvidenceError("unsafe recording input", retryable=False)
+
+    worker = RecordingEvidenceWorker(
+        ledger_factory=lambda: EventLedger(db_path, evidence_roots=[str(tmp_path)], recording_evidence=RecordingEvidenceConfig(enabled=True)),
+        extractor=Extractor(), worker_id="extract-test", lease_ms=1_000, max_retries=3, retry_delay_ms=0,
+    )
+    assert worker.run_once() is True
+    with EventLedger(db_path, evidence_roots=[str(tmp_path)], recording_evidence=RecordingEvidenceConfig(enabled=True)) as ledger:
+        case = ledger.get_case("case-1")
+        job = ledger.claim_job(JobKind.EVIDENCE_EXTRACT, "other", 1000)
+    assert case is not None and case.status == "manual_review"
+    assert job is None
+
+
+def test_recording_worker_exhausted_reclaimed_job_marks_event_manual_review(tmp_path: Path) -> None:
+    db_path = tmp_path / "events.db"
+    _record_recording_case(db_path, tmp_path)
+    with EventLedger(db_path) as ledger:
+        claimed = ledger.claim_job(JobKind.EVIDENCE_EXTRACT, "old", 1000)
+        assert claimed is not None
+        ledger.fail_evidence_extract_job(claimed, "old", "temporary", max_retries=5, retry_delay_ms=0)
+
+    calls = 0
+    class Extractor:
+        def extract(self, case):
+            nonlocal calls
+            calls += 1
+            return _recording_artifacts(tmp_path)
+
+    worker = RecordingEvidenceWorker(
+        ledger_factory=lambda: EventLedger(db_path, evidence_roots=[str(tmp_path)], recording_evidence=RecordingEvidenceConfig(enabled=True)),
+        extractor=Extractor(), worker_id="extract-test", lease_ms=1_000, max_retries=1, retry_delay_ms=0,
+    )
+    assert worker.run_once() is True
+    assert calls == 0
+    with EventLedger(db_path, evidence_roots=[str(tmp_path)], recording_evidence=RecordingEvidenceConfig(enabled=True)) as ledger:
+        case = ledger.get_case("case-1")
+    assert case is not None and case.status == "manual_review"
+
+
+def test_recording_worker_stop_event_prevents_claim(tmp_path: Path) -> None:
+    db_path = tmp_path / "events.db"
+    _record_recording_case(db_path, tmp_path)
+    stopping = threading.Event()
+    stopping.set()
+    calls = 0
+
+    class Extractor:
+        def extract(self, case):
+            nonlocal calls
+            calls += 1
+            return _recording_artifacts(tmp_path)
+
+    worker = RecordingEvidenceWorker(
+        ledger_factory=lambda: EventLedger(db_path, evidence_roots=[str(tmp_path)], recording_evidence=RecordingEvidenceConfig(enabled=True)),
+        extractor=Extractor(), worker_id="extract-test", lease_ms=1_000, max_retries=1, retry_delay_ms=0,
+    )
+    worker.run(stopping)
+    assert calls == 0
+
+
+def test_review_prompt_requires_evidence_reader_and_wall_clock_context() -> None:
+    prompt = build_review_prompt(
+        ReviewContext(event_id="case-1", source="camera-1", timestamp_ms=1000, frame_id=1)
+    )
+    assert "开始复核前必须先调用 evidence_reader" in prompt
+    assert "wall_clock_approximate" in prompt
+    assert "不得声称它们是检测帧" in prompt
 
 
 def test_review_worker_appends_valid_result_and_completes_job(
@@ -96,6 +243,50 @@ def test_review_worker_appends_valid_result_and_completes_job(
     assert case.review["verdict"] == "violation"
     assert remaining is None
     assert list((tmp_path / "outputs" / "case-1").glob("result-*.json"))
+
+
+def test_review_worker_retrieves_rules_before_runner_and_accepts_matching_citation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "events.db"
+    evidence_id = _record_case(db_path, tmp_path / "frame.jpg")
+    monkeypatch.setenv("SSV_OUTPUTS_DIR", str(tmp_path / "outputs"))
+    calls: list[str] = []
+
+    class Retriever:
+        async def retrieve(self, query, *, top_k=5, filters=None):
+            calls.append("retriever")
+            return RetrievalResult(
+                query=query,
+                backend="fake",
+                chunks=[Chunk(
+                    chunk_id="chunk-1", content="必须佩戴安全帽", score=0.9,
+                    metadata={"source": "rules.md", "rule_id": "r1", "section": "5.2"},
+                )],
+            )
+
+    def runner(context, rule_context):
+        calls.append("runner")
+        assert rule_context is not None and rule_context.available
+        return json.dumps({
+            "verdict": "violation", "confidence": 0.9,
+            "evidence_status": "available", "evidence_ids": [evidence_id],
+            "claims": [], "explanation": "规则和证据支持结论",
+            "rule_citations": [{
+                "chunk_id": "chunk-1", "source": "rules.md",
+                "rule_id": "r1", "section": "5.2",
+            }],
+        })
+
+    worker = ReviewWorker(
+        ledger_factory=lambda: EventLedger(db_path), runner=runner,
+        rule_retriever=Retriever(), worker_id="review-test", lease_ms=1_000,
+        max_retries=2, retry_delay_ms=0,
+    )
+
+    assert worker.run_once() is True
+    assert calls == ["retriever", "runner"]
 
 
 def test_review_worker_refreshes_evidence_before_constructing_context(

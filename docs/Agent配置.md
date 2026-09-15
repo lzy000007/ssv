@@ -40,7 +40,7 @@ uv run python -m ssv_agent
 
 ## 主运行配置
 
-Agent 读取与 runner 共用的 `config/ssv.yaml`，只拥有其中的 `version`、`logging`、`redis` 和 `agent` 配置段；复制模板：
+Agent 读取与 runner 共用的 `config/ssv.yaml`，拥有其中的 `version`、`logging`、`redis`、最小化的 `sources`（仅 `id`/`uri`）和 `agent` 配置段；复制模板：
 
 ```bash
 cp config/ssv.example.yaml config/ssv.yaml
@@ -87,6 +87,45 @@ agent:
 `evidence_roots: []` 是 fail closed 配置：事件仍可入账，但 Redis 提供的任意 `frame_path`/`clip_path` 都不会被登记为可读证据。证据根必须是绝对路径，解析后的 symlink 也不能越界。
 
 结果写入路径目前有两个配置面：`agent.output_dir` 会被严格解析，但结果写入器使用 `SSV_OUTPUTS_DIR`；部署时应优先设置后者。这是当前实现边界，不要以为修改 YAML 字段会改变已落盘结果目录。
+
+## 录像上下文证据
+
+启用 `agent.recording_evidence` 后，Agent 会在事件墙钟附近生成一个 clip 和三张帧，取证完成后才创建视觉复核任务。录像功能由仓库外的 MediaMTX 配置管理，配置文件路径固定为：
+
+```text
+/mnt/work/ai-video-analysis/mediamtx/mediamtx.yml
+```
+
+MediaMTX 的 `/stream` path 应保持 `source: publisher`，并将原始 fMP4 分段写入证据根目录：
+
+```text
+artifacts/evidence/
+  recordings/stream/       # MediaMTX 原始分段，按 1 天保留
+  derived/<event_id>/      # Agent 派生证据，长期保留
+    context.mp4
+    frame-01.jpg
+    frame-02.jpg
+    frame-03.jpg
+    manifest.json
+```
+
+生产环境应将 `agent.evidence_roots[0]` 配置为上述 `artifacts/evidence` 的绝对路径，并确保 MediaMTX 与 Agent 对该目录具有相应读写权限。只有 SQLite `EventLedger` 已登记的文件会被 `evidence_reader` 复制给模型；模型收到的是 DeerFlow 虚拟输出路径，不会获得 `recordings` 或宿主机绝对路径。
+
+配置示例：
+
+```yaml
+agent:
+  evidence_roots:
+    - "/mnt/work/ai-video-analysis/ssv/artifacts/evidence"
+  recording_evidence:
+    enabled: true
+    clip_before_ms: 2500
+    clip_after_ms: 2500
+```
+
+默认窗口为事件时间点前后各 2.5 秒，共 5 秒；三帧分别位于 `T-1000ms`、`T` 和 `T+1000ms`。`clip_before_ms` 与 `clip_after_ms` 都不得小于 1000：三帧偏移固定为 `-1000`/`0`/`+1000` 毫秒，窗口更小会让帧落到窗口之外。`timestamp_ms` 来自发布端墙钟，只能标记为 `wall_clock_approximate`，因此 clip/帧是墙钟附近的上下文，不应被描述为检测同帧证据。
+
+原始 `recordings/` 分段由 MediaMTX 按 `recordDeleteAfter: 1d` 自动清理；Agent 派生的 clip、帧和 manifest 不在本阶段自动删除，需由部署方制定长期保留策略。窗口缺段、录像尚未就绪或达到重试上限时，事件状态进入 `manual_review`，不创建无图 review job；人工复核应据此判断证据不可用，不能将失败当作“没有目标”结论。
 
 ## DeerFlow 复核 worker
 
@@ -154,21 +193,69 @@ SSV_EMBEDDING_API_KEY=replace-me
 SSV_EMBEDDING_BASE_URL=https://api.example.com/v1
 ```
 
+规则向量 RAG 与事件语义索引复用 `agent.indexing.embedding_backend` 和
+`agent.indexing.embedding_model`，避免入库和查询使用不同模型。`mock` 只用于测试，不能
+用于 Qdrant 规则 RAG。
+
 Agent 的持久化默认位置和覆盖变量：
 
 | 默认位置 | 环境变量 | 内容 |
 | --- | --- | --- |
 | `data/events.db` | `SSV_EVENT_DB_PATH` | SQLite EventLedger |
-| `data/qdrant` | `SSV_QDRANT_PATH` | 本地 Qdrant |
+| `agent/data/qdrant` | `SSV_QDRANT_PATH` | 本地 Qdrant |
 | `outputs` | `SSV_OUTPUTS_DIR` | 复核 JSON 结果 |
 | 本地 Qdrant | `SSV_QDRANT_URL` | 设置后改用 Qdrant 服务 |
 | Qdrant 服务 | `SSV_QDRANT_API_KEY` | 服务认证凭据 |
 
-表中的相对路径相对于 Agent 进程工作目录解析；`uv run ./ssv agent` 通常在 `agent/` 目录启动，因此默认文件通常位于 `agent/data/` 和 `agent/outputs/`。
+Qdrant 默认路径固定为 Agent 项目下的 `agent/data/qdrant`，不随当前工作目录变化；设置
+`SSV_QDRANT_PATH` 时可使用绝对路径。其他表中相对路径仍相对于 Agent 进程工作目录解析。
 
 Qdrant 只保存可重建的语义索引。embedding backend、model 或 schema 变化会产生新的物理 collection 身份；切换模型后需要重新入队 index job，不要把不同模型的向量混写。
 
-规则检索当前仍使用带来源的 mock backend，不能当作已经接入生产规则/SOP 知识库。
+## 规则知识检索
+
+`rule_retriever` 默认使用 `local_markdown` 后端，读取 `agent/knowledge/` 下的 `.md`、`.txt`
+规章文件。后端按编号条款切分内容，在内存中检索并最多返回两条带来源的规则片段；规章
+文件修改后会在下一次检索自动重建索引。
+
+当前已放入 `GB+26860-2011 (1).md`。如需临时使用原有固定样例，可在启动 Agent 前设置：
+
+```bash
+export SSV_KNOWLEDGE_BACKEND=mock
+```
+
+本地规章检索不依赖 Qdrant、embedding 或 index worker。
+
+需要使用 Qdrant 规则 RAG 时，在 `config/ssv.yaml` 中配置同一组 embedding 和知识后端：
+
+```yaml
+agent:
+  indexing:
+    embedding_backend: "bge_m3"
+    embedding_model: "/opt/models/bge-m3"
+  knowledge:
+    backend: "qdrant"
+    qdrant_path: "data/qdrant"
+    min_score: 0.5
+```
+
+`bge_m3` 需要先安装可选依赖，且模型目录必须已经存在。规则索引不会由 Agent 启动自动
+生成，首次使用或规章变更后执行：
+
+```bash
+cd agent
+uv sync --extra dev --extra bge-m3
+uv run --extra bge-m3 python -m ssv_agent.knowledge_ingest --config ../config/ssv.yaml
+```
+
+入库命令会按最多 20 条文本调用 embedding，成功后只保留当前规章对应的 chunk；规章目录
+为空会清空当前规则索引，目录不存在或 embedding 失败会返回错误。未创建或为空的 Qdrant
+索引会显式报告为不可用，不会返回随机条款。`min_score` 用于过滤低相似度结果，没有达到
+阈值时返回“无知识依据”。
+
+复核结果 JSON 的确定性结论还会写入 `rule_citations`，每项包含 `chunk_id`、`source`、
+`rule_id` 和 `section`。这些字段必须与本次预检索实际返回的规则片段一致；没有可用规则时，
+结果只能是 `uncertain`。
 
 ## 运行时缓存与 Redis 运维
 

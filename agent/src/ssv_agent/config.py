@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
-
 
 _CONFIG_KEYS = frozenset(
     {
@@ -20,7 +19,7 @@ _CONFIG_KEYS = frozenset(
         "agent",
     }
 )
-_AGENT_CONFIG_KEYS = frozenset({"version", "logging", "redis", "agent"})
+_AGENT_CONFIG_KEYS = frozenset({"version", "logging", "redis", "sources", "agent"})
 
 
 class _StrictConfigModel(BaseModel):
@@ -63,6 +62,29 @@ class IndexWorkerConfig(WorkerConfig):
     embedding_model: str | None = None
 
 
+class AgentSourceConfig(_StrictConfigModel):
+    """Agent 所需的 source 标识和录像路径来源。"""
+
+    id: str = Field(min_length=1)
+    uri: str = Field(min_length=1)
+
+
+class RecordingEvidenceConfig(_StrictConfigModel):
+    """由 Agent 持久 worker 生成录像上下文证据的配置。"""
+
+    enabled: bool = False
+    clip_before_ms: int = Field(default=2500, ge=1000)
+    clip_after_ms: int = Field(default=2500, ge=1000)
+
+
+class KnowledgeConfig(_StrictConfigModel):
+    """规则知识检索与 Qdrant 投影配置。"""
+
+    backend: Literal["local_markdown", "qdrant", "mock"] = "local_markdown"
+    qdrant_path: str = Field(default="data/qdrant", min_length=1)
+    min_score: float = Field(default=0.5, ge=-1.0, le=1.0)
+
+
 class AgentConfig(_StrictConfigModel):
     state_machine_timeout: int = Field(default=300, gt=0)
     max_retries: int = Field(default=3, ge=0)
@@ -73,6 +95,8 @@ class AgentConfig(_StrictConfigModel):
     dedup_cooldown_seconds: float = Field(default=30.0, gt=0)
     review: ReviewWorkerConfig = Field(default_factory=ReviewWorkerConfig)
     indexing: IndexWorkerConfig = Field(default_factory=IndexWorkerConfig)
+    recording_evidence: RecordingEvidenceConfig = Field(default_factory=RecordingEvidenceConfig)
+    knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
 
     @field_validator("evidence_roots")
     @classmethod
@@ -82,11 +106,19 @@ class AgentConfig(_StrictConfigModel):
                 raise ValueError("evidence_roots entries must be absolute paths")
         return roots
 
+    @model_validator(mode="after")
+    def validate_recording_evidence(self) -> Self:
+        recording_evidence = self.recording_evidence
+        if recording_evidence.enabled and not self.evidence_roots:
+            raise ValueError("recording_evidence requires non-empty evidence_roots")
+        return self
+
 
 class SsvConfig(_StrictConfigModel):
     version: Literal["2.0"] = "2.0"
     logging: LoggingConfig = LoggingConfig()
     redis: RedisConfig = RedisConfig()
+    sources: list[AgentSourceConfig] = Field(default_factory=list)
     agent: AgentConfig = AgentConfig()
 
     @model_validator(mode="before")
@@ -100,8 +132,18 @@ class SsvConfig(_StrictConfigModel):
             if key not in _CONFIG_KEYS:
                 raise ValueError(f"unknown configuration key: {key}")
 
-        # The Agent owns only these sections; the runner validates the rest.
-        return {key: item for key, item in value.items() if key in _AGENT_CONFIG_KEYS}
+        # The Agent owns only these sections. Runner-only source fields are not part of
+        # the Agent config contract, so retain only the identity and RTSP URI it needs.
+        agent_config = {key: item for key, item in value.items() if key in _AGENT_CONFIG_KEYS}
+        sources = value.get("sources")
+        if isinstance(sources, list):
+            agent_config["sources"] = [
+                {key: source.get(key) for key in ("id", "uri")}
+                if isinstance(source, dict)
+                else source
+                for source in sources
+            ]
+        return agent_config
 
 
 def _validate_loaded_config(data: object) -> SsvConfig:

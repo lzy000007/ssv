@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ssv_meta.hpp"
+#include "ssv_config.hpp"
 
 #include <gst/base/gstbasetransform.h>
 
@@ -13,6 +14,10 @@
 std::string ssv_pub_build_event_payload(
     const SsvTrackedFrame &frame,
     std::int64_t timestamp_ms);
+std::string ssv_pub_build_event_payload(
+    const SsvTrackedFrame &frame,
+    std::int64_t timestamp_ms,
+    const ssv::SsvEventRuleConfig &event_rule);
 bool ssv_pub_snapshot_is_current(
     const SsvSourceContext &source_context,
     const SsvTrackedFrame &frame);

@@ -35,6 +35,11 @@ ssv::SsvConfig make_config()
     ssv::SsvSourceConfig source;
     source.id = "camera-01";
     source.uri = "rtsp://127.0.0.1/test";
+    source.event_rule.event_type = "person_without_helmet";
+    source.event_rule.severity = "high";
+    source.event_rule.rule_id = "rule-1";
+    source.event_rule.rule_version = "v1";
+    source.event_rule.rule_facts_json = R"({"helmet_required":true})";
     source.decode.mode = ssv::SsvDecodeMode::Vaapi;
     source.decode.device = {
         ssv::SsvDecodeDeviceKind::Drm,
@@ -442,6 +447,30 @@ void test_builder_passes_one_source_context_to_analysis_plugins()
     gint publish_cooldown_ms = 0;
     g_object_get(publish, "publish-cooldown-ms", &publish_cooldown_ms, nullptr);
     assert(publish_cooldown_ms == 12345);
+
+    gchar *event_type = nullptr;
+    gchar *severity = nullptr;
+    gchar *rule_id = nullptr;
+    gchar *rule_version = nullptr;
+    gchar *rule_facts_json = nullptr;
+    g_object_get(
+        publish,
+        "event-type", &event_type,
+        "severity", &severity,
+        "rule-id", &rule_id,
+        "rule-version", &rule_version,
+        "rule-facts-json", &rule_facts_json,
+        nullptr);
+    assert(std::string(event_type) == "person_without_helmet");
+    assert(std::string(severity) == "high");
+    assert(std::string(rule_id) == "rule-1");
+    assert(std::string(rule_version) == "v1");
+    assert(std::string(rule_facts_json) == R"({"helmet_required":true})");
+    g_free(event_type);
+    g_free(severity);
+    g_free(rule_id);
+    g_free(rule_version);
+    g_free(rule_facts_json);
 
     gboolean add_borders = FALSE;
     g_object_get(analysis_scale, "add-borders", &add_borders, nullptr);

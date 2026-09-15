@@ -8,6 +8,8 @@ import pytest
 
 import ssv_agent.event_store.ledger as ledger_module
 from ssv_agent.event_store import EventLedger, JobKind, LeaseLostError
+from ssv_agent.config import RecordingEvidenceConfig
+from ssv_agent.recording_evidence import RecordingEvidenceArtifact
 from ssv_agent.result import ReviewResult
 from ssv_agent.review_context import ReviewContext
 
@@ -32,6 +34,141 @@ def _context() -> ReviewContext:
             ],
         }
     )
+
+
+def _enabled_config() -> RecordingEvidenceConfig:
+    return RecordingEvidenceConfig(enabled=True, clip_after_ms=2500)
+
+
+def _artifacts(root: Path) -> tuple[RecordingEvidenceArtifact, ...]:
+    derived = root / "derived" / "evt-1"
+    derived.mkdir(parents=True)
+    values = [("clip", "context.mp4", "video/mp4"), ("frame", "frame-01.jpg", "image/jpeg"),
+              ("frame", "frame-02.jpg", "image/jpeg"), ("frame", "frame-03.jpg", "image/jpeg")]
+    result = []
+    for kind, name, mime in values:
+        path = derived / name
+        path.write_bytes(name.encode())
+        result.append(RecordingEvidenceArtifact(kind=kind, path=path,
+            sha256=__import__("hashlib").sha256(path.read_bytes()).hexdigest(),
+            mime_type=mime, size=path.stat().st_size, mtime=path.stat().st_mtime))
+    return tuple(result)
+
+
+def test_enabled_recording_evidence_creates_only_delayed_extract_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ledger_module, "_now_ms", lambda: 1_000)
+    with EventLedger(tmp_path / "events.db", recording_evidence=_enabled_config()) as ledger:
+        outcome = ledger.record(_context())
+    assert {job.kind for job in outcome.jobs} == {JobKind.EVIDENCE_EXTRACT}
+    assert outcome.jobs[0].available_at_ms == _context().timestamp_ms + 2500
+
+
+def test_schema_migration_preserves_legacy_review_and_index_jobs(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+            CREATE TABLE events (event_id TEXT PRIMARY KEY, source TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL, frame_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', created_ms INTEGER NOT NULL);
+            CREATE TABLE durable_jobs (
+                job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL CHECK (kind IN ('review', 'index')),
+                entity_id TEXT NOT NULL REFERENCES events(event_id), entity_revision INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('pending', 'processing', 'completed', 'dead')),
+                attempts INTEGER NOT NULL DEFAULT 0, lease_owner TEXT, lease_expires_ms INTEGER,
+                available_at_ms INTEGER NOT NULL, last_error TEXT, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL,
+                UNIQUE (kind, entity_id, entity_revision));
+            INSERT INTO events VALUES ('legacy', 'camera', 1, 1, 'pending', 1);
+            INSERT INTO durable_jobs(kind, entity_id, entity_revision, state, available_at_ms, created_ms, updated_ms)
+                VALUES ('review', 'legacy', 0, 'pending', 0, 1, 1), ('index', 'legacy', 0, 'pending', 0, 1, 1);
+        """)
+    with EventLedger(db_path) as ledger:
+        assert ledger.claim_job(JobKind.REVIEW, "r", 1000) is not None
+        assert ledger.claim_job(JobKind.INDEX, "i", 1000) is not None
+
+
+def test_complete_evidence_extract_registers_four_refs_and_one_review(tmp_path: Path) -> None:
+    artifacts = _artifacts(tmp_path)
+    with EventLedger(tmp_path / "events.db", evidence_roots=[str(tmp_path)], recording_evidence=_enabled_config()) as ledger:
+        ledger.record(_context())
+        job = ledger.claim_job(JobKind.EVIDENCE_EXTRACT, "extractor", 1000)
+        assert job is not None
+        ledger.complete_evidence_extract_job(job, "extractor", artifacts)
+        case = ledger.get_case("evt-1")
+        review = ledger.claim_job(JobKind.REVIEW, "reviewer", 1000)
+    assert case is not None
+    assert len(case.evidence) == 4
+    assert review is not None
+
+
+def test_complete_evidence_extract_is_idempotent(tmp_path: Path) -> None:
+    artifacts = _artifacts(tmp_path)
+    with EventLedger(tmp_path / "events.db", evidence_roots=[str(tmp_path)], recording_evidence=_enabled_config()) as ledger:
+        ledger.record(_context())
+        job = ledger.claim_job(JobKind.EVIDENCE_EXTRACT, "extractor", 1000)
+        assert job is not None
+        ledger.complete_evidence_extract_job(job, "extractor", artifacts)
+        ledger.complete_evidence_extract_job(job, "extractor", artifacts)
+        rows = ledger._store._conn.execute("SELECT kind FROM durable_jobs WHERE entity_id = 'evt-1'").fetchall()
+    assert [row["kind"] for row in rows].count("review") == 1
+
+
+def test_failed_evidence_extract_dead_marks_manual_review_without_review_job(tmp_path: Path) -> None:
+    with EventLedger(tmp_path / "events.db", recording_evidence=_enabled_config()) as ledger:
+        ledger.record(_context())
+        job = ledger.claim_job(JobKind.EVIDENCE_EXTRACT, "extractor", 1000)
+        assert job is not None
+        retry_state = ledger.fail_evidence_extract_job(
+            job, "extractor", "retryable failure", max_retries=2, retry_delay_ms=0
+        )
+        retry = ledger.claim_job(JobKind.EVIDENCE_EXTRACT, "extractor", 1000)
+        assert retry is not None
+        state = ledger.fail_evidence_extract_job(
+            retry, "extractor", "final failure", max_retries=2, retry_delay_ms=0
+        )
+        case = ledger.get_case("evt-1")
+        review = ledger.claim_job(JobKind.REVIEW, "reviewer", 1000)
+    assert retry_state == ledger_module.JobState.PENDING
+    assert state == ledger_module.JobState.DEAD
+    assert case is not None and case.status == "manual_review"
+    assert review is None
+
+
+def test_complete_evidence_extract_rejects_path_outside_root(tmp_path: Path) -> None:
+    artifacts = list(_artifacts(tmp_path))
+    outside = tmp_path.parent / "outside.mp4"
+    outside.write_bytes(b"outside")
+    artifacts[0] = RecordingEvidenceArtifact(kind="clip", path=outside,
+        sha256="x", mime_type="video/mp4", size=7, mtime=outside.stat().st_mtime)
+    with EventLedger(tmp_path / "events.db", evidence_roots=[str(tmp_path)], recording_evidence=_enabled_config()) as ledger:
+        ledger.record(_context())
+        job = ledger.claim_job(JobKind.EVIDENCE_EXTRACT, "extractor", 1000)
+        assert job is not None
+        with pytest.raises(ValueError, match="evidence"):
+            ledger.complete_evidence_extract_job(job, "extractor", tuple(artifacts))
+
+
+def test_complete_evidence_extract_rejects_artifact_with_wrong_mime_type(tmp_path: Path) -> None:
+    artifacts = list(_artifacts(tmp_path))
+    clip = artifacts[0]
+    artifacts[0] = RecordingEvidenceArtifact(
+        kind=clip.kind,
+        path=clip.path,
+        sha256=clip.sha256,
+        mime_type="image/jpeg",
+        size=clip.size,
+        mtime=clip.mtime,
+    )
+    with EventLedger(
+        tmp_path / "events.db",
+        evidence_roots=[str(tmp_path)],
+        recording_evidence=_enabled_config(),
+    ) as ledger:
+        ledger.record(_context())
+        job = ledger.claim_job(JobKind.EVIDENCE_EXTRACT, "extractor", 1000)
+        assert job is not None
+        with pytest.raises(ValueError, match="evidence"):
+            ledger.complete_evidence_extract_job(job, "extractor", tuple(artifacts))
 
 
 def test_record_creates_one_authoritative_case_and_initial_jobs(tmp_path: Path) -> None:

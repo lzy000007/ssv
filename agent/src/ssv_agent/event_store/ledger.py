@@ -12,9 +12,13 @@ import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from ssv_agent.config import RecordingEvidenceConfig
 from ssv_agent.event_store.sqlite_store import SsvEventStore
+
+if TYPE_CHECKING:
+    from ssv_agent.recording_evidence import RecordingEvidenceArtifact
 from ssv_agent.review_context import ReviewContext
 
 
@@ -23,6 +27,7 @@ class JobKind(StrEnum):
 
     REVIEW = "review"
     INDEX = "index"
+    EVIDENCE_EXTRACT = "evidence_extract"
 
 
 class JobState(StrEnum):
@@ -189,8 +194,10 @@ class EventLedger:
         self,
         db_path: str | os.PathLike[str] | None = None,
         evidence_roots: list[str] | None = None,
+        recording_evidence: RecordingEvidenceConfig | None = None,
     ) -> None:
         self._evidence_roots = _load_evidence_roots(evidence_roots)
+        self._recording_evidence = recording_evidence or RecordingEvidenceConfig()
         self._store = SsvEventStore(db_path)
 
     @property
@@ -258,7 +265,13 @@ class EventLedger:
                 )
                 self._record_detections(connection, event_id, context)
                 self._record_evidence(connection, event_id, context)
-                for kind in JobKind:
+                if self._recording_evidence.enabled:
+                    jobs_to_create = (
+                        (JobKind.EVIDENCE_EXTRACT, context.timestamp_ms + self._recording_evidence.clip_after_ms),
+                    )
+                else:
+                    jobs_to_create = ((JobKind.REVIEW, now_ms), (JobKind.INDEX, now_ms))
+                for job_kind, available_at_ms in jobs_to_create:
                     connection.execute(
                         """
                         INSERT INTO durable_jobs (
@@ -267,7 +280,7 @@ class EventLedger:
                         ) VALUES (?, ?, 0, 'pending', 0, ?, ?, ?)
                         ON CONFLICT(kind, entity_id, entity_revision) DO NOTHING
                         """,
-                        (kind.value, event_id, now_ms, now_ms, now_ms),
+                        (job_kind.value, event_id, available_at_ms, now_ms, now_ms),
                     )
 
         case = self.get_case(event_id)
@@ -394,6 +407,88 @@ class EventLedger:
             self._complete_owned_job(connection, job, worker_id)
         return revision
 
+    def complete_evidence_extract_job(
+        self,
+        job: DurableJob,
+        worker_id: str,
+        artifacts: tuple["RecordingEvidenceArtifact", ...],
+    ) -> None:
+        """原子登记完整取证集、创建 review，并完成 extract job。"""
+        if job.kind != JobKind.EVIDENCE_EXTRACT:
+            raise ValueError("complete_evidence_extract_job requires an evidence extract job")
+        with self._store.transaction(immediate=True) as connection:
+            now_ms = _now_ms()
+            current = connection.execute(
+                "SELECT * FROM durable_jobs WHERE job_id = ?", (job.job_id,)
+            ).fetchone()
+            if current is not None and current["state"] == JobState.COMPLETED.value:
+                return
+            self._validate_extract_lease(current, job, worker_id, now_ms)
+            event = connection.execute(
+                "SELECT revision FROM events WHERE event_id = ?", (job.entity_id,)
+            ).fetchone()
+            if event is None:
+                raise KeyError(f"unknown event case: {job.entity_id}")
+            if event["revision"] != job.entity_revision:
+                raise ValueError("evidence extract job revision no longer matches the current event revision")
+            kinds = [artifact.kind for artifact in artifacts]
+            if len(artifacts) != 4 or kinds.count("clip") != 1 or kinds.count("frame") != 3:
+                raise ValueError("evidence extract requires exactly one clip and three frames")
+            for artifact in artifacts:
+                resolved = self.resolve_evidence_path(artifact.path)
+                if resolved is None or not self._artifact_metadata_matches(resolved, artifact):
+                    raise ValueError("evidence artifact path or metadata is invalid")
+                canonical = str(resolved)
+                evidence_id = _evidence_id(job.entity_id, artifact.kind, canonical)
+                connection.execute(
+                    """
+                    INSERT INTO evidence (
+                        event_id, evidence_id, kind, path, mime_type, available,
+                        size, mtime, sha256, source_pts_start, source_pts_end, stream_generation
+                    ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, NULL, NULL)
+                    ON CONFLICT(event_id, kind, path) DO UPDATE SET
+                        evidence_id = excluded.evidence_id, mime_type = excluded.mime_type,
+                        available = 1, size = excluded.size, mtime = excluded.mtime,
+                        sha256 = excluded.sha256
+                    """,
+                    (job.entity_id, evidence_id, artifact.kind, canonical,
+                     artifact.mime_type, artifact.size, artifact.mtime, artifact.sha256),
+                )
+            connection.execute(
+                """
+                INSERT INTO durable_jobs (
+                    kind, entity_id, entity_revision, state, attempts,
+                    available_at_ms, created_ms, updated_ms
+                ) VALUES ('review', ?, ?, 'pending', 0, ?, ?, ?)
+                ON CONFLICT(kind, entity_id, entity_revision) DO NOTHING
+                """,
+                (job.entity_id, job.entity_revision, now_ms, now_ms, now_ms),
+            )
+            self._complete_owned_job_kind(connection, job, worker_id, JobKind.EVIDENCE_EXTRACT)
+
+    def fail_evidence_extract_job(
+        self,
+        job: DurableJob,
+        worker_id: str,
+        error: str,
+        max_retries: int,
+        retry_delay_ms: int,
+    ) -> JobState:
+        """记录取证失败；达到上限时与事件转人工复核同事务提交。"""
+        if job.kind != JobKind.EVIDENCE_EXTRACT:
+            raise ValueError("fail_evidence_extract_job requires an evidence extract job")
+        with self._store.transaction(immediate=True) as connection:
+            state = self._fail_job_in_transaction(
+                connection, job.job_id, worker_id, job.attempts,
+                error, max_retries, retry_delay_ms,
+            )
+            if state == JobState.DEAD:
+                connection.execute(
+                    "UPDATE events SET status = 'manual_review' WHERE event_id = ?",
+                    (job.entity_id,),
+                )
+            return state
+
     def enqueue_all_index_jobs(self) -> int:
         """为当前案件投影重新入队 index job，供可重建的全量索引使用。"""
         now_ms = _now_ms()
@@ -512,42 +607,40 @@ class EventLedger:
     ) -> JobState:
         """仅允许持有未过期 lease 的 worker 记录失败或重试。"""
         with self._store.transaction(immediate=True) as connection:
-            now_ms = _now_ms()
-            row = connection.execute(
-                """
-                SELECT attempts FROM durable_jobs
-                WHERE job_id = ? AND state = 'processing' AND lease_owner = ?
-                    AND attempts = ? AND lease_expires_ms > ?
-                """,
-                (job_id, worker_id, attempts, now_ms),
-            ).fetchone()
-            if row is None:
-                raise LeaseLostError(f"lost lease for durable job {job_id}")
-            next_state = (
-                JobState.DEAD if row["attempts"] >= max_retries else JobState.PENDING
+            return self._fail_job_in_transaction(
+                connection, job_id, worker_id, attempts, error,
+                max_retries, retry_delay_ms,
             )
-            available_at_ms = now_ms + max(retry_delay_ms, 0)
-            cursor = connection.execute(
-                """
-                UPDATE durable_jobs
-                SET state = ?, lease_owner = NULL, lease_expires_ms = NULL,
-                    available_at_ms = ?, last_error = ?, updated_ms = ?
+
+    @staticmethod
+    def _fail_job_in_transaction(
+        connection: Any,
+        job_id: int,
+        worker_id: str,
+        attempts: int,
+        error: str,
+        max_retries: int,
+        retry_delay_ms: int,
+    ) -> JobState:
+        now_ms = _now_ms()
+        row = connection.execute(
+            "SELECT attempts FROM durable_jobs WHERE job_id = ? AND state = 'processing' "
+            "AND lease_owner = ? AND attempts = ? AND lease_expires_ms > ?",
+            (job_id, worker_id, attempts, now_ms),
+        ).fetchone()
+        if row is None:
+            raise LeaseLostError(f"lost lease for durable job {job_id}")
+        next_state = JobState.DEAD if row["attempts"] >= max_retries else JobState.PENDING
+        cursor = connection.execute(
+            """UPDATE durable_jobs SET state = ?, lease_owner = NULL, lease_expires_ms = NULL,
+                available_at_ms = ?, last_error = ?, updated_ms = ?
                 WHERE job_id = ? AND state = 'processing' AND lease_owner = ?
-                    AND attempts = ? AND lease_expires_ms > ?
-                """,
-                (
-                    next_state.value,
-                    available_at_ms,
-                    error,
-                    now_ms,
-                    job_id,
-                    worker_id,
-                    attempts,
-                    now_ms,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise LeaseLostError(f"lost lease for durable job {job_id}")
+                AND attempts = ? AND lease_expires_ms > ?""",
+            (next_state.value, now_ms + max(retry_delay_ms, 0), error, now_ms,
+             job_id, worker_id, attempts, now_ms),
+        )
+        if cursor.rowcount != 1:
+            raise LeaseLostError(f"lost lease for durable job {job_id}")
         return next_state
 
     def _append_review_in_transaction(
@@ -665,10 +758,32 @@ class EventLedger:
             raise LeaseLostError(f"lost lease for durable job {job.job_id}")
 
     @staticmethod
+    def _validate_extract_lease(row: Any, job: DurableJob, worker_id: str, now_ms: int) -> None:
+        if row is None or (
+            row["kind"] != JobKind.EVIDENCE_EXTRACT.value
+            or row["entity_id"] != job.entity_id
+            or row["entity_revision"] != job.entity_revision
+            or row["state"] != JobState.PROCESSING.value
+            or row["lease_owner"] != worker_id
+            or row["attempts"] != job.attempts
+            or row["lease_expires_ms"] is None
+            or row["lease_expires_ms"] <= now_ms
+        ):
+            raise LeaseLostError(f"lost lease for durable job {job.job_id}")
+    @staticmethod
     def _complete_owned_job(
         connection: Any,
         job: DurableJob,
         worker_id: str,
+    ) -> None:
+        EventLedger._complete_owned_job_kind(connection, job, worker_id, JobKind.REVIEW)
+
+    @staticmethod
+    def _complete_owned_job_kind(
+        connection: Any,
+        job: DurableJob,
+        worker_id: str,
+        kind: JobKind,
     ) -> None:
         now_ms = _now_ms()
         cursor = connection.execute(
@@ -683,7 +798,7 @@ class EventLedger:
             (
                 now_ms,
                 job.job_id,
-                JobKind.REVIEW.value,
+                kind.value,
                 job.entity_id,
                 job.entity_revision,
                 worker_id,
@@ -693,6 +808,22 @@ class EventLedger:
         )
         if cursor.rowcount != 1:
             raise LeaseLostError(f"lost lease for durable job {job.job_id}")
+
+    def _artifact_metadata_matches(self, resolved: Path, artifact: "RecordingEvidenceArtifact") -> bool:
+        try:
+            info = resolved.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                return False
+            expected_mime = "video/mp4" if artifact.kind == "clip" else "image/jpeg"
+            if artifact.mime_type != expected_mime:
+                return False
+            if info.st_size != artifact.size or info.st_mtime != artifact.mtime:
+                return False
+            if hashlib.sha256(resolved.read_bytes()).hexdigest() != artifact.sha256:
+                return False
+        except OSError:
+            return False
+        return True
 
     def _record_detections(
         self,

@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS reviews (
 
 CREATE TABLE IF NOT EXISTS durable_jobs (
     job_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL CHECK (kind IN ('review', 'index')),
+    kind TEXT NOT NULL CHECK (kind IN ('review', 'index', 'evidence_extract')),
     entity_id TEXT NOT NULL REFERENCES events(event_id),
     entity_revision INTEGER NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('pending', 'processing', 'completed', 'dead')),
@@ -137,12 +137,68 @@ _COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         "policy_id": "TEXT",
         "model_id": "TEXT",
     },
+    "reviews": {
+        "policy_id": "TEXT",
+        "model_id": "TEXT",
+    },
 }
 
 
 def migrate_schema(connection: sqlite3.Connection) -> None:
     """以可重复方式将历史数据库升级到当前账本结构。"""
     connection.executescript(SCHEMA_SQL)
+    durable_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'durable_jobs'"
+    ).fetchone()[0]
+    if "evidence_extract" not in durable_sql:
+        # SQLite cannot alter a CHECK constraint. Rebuild the table in one transaction,
+        # explicitly copying every durable column so leases and retry history survive.
+        connection.execute("BEGIN")
+        try:
+            connection.execute(
+                """
+                CREATE TABLE durable_jobs_new (
+                    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL CHECK (kind IN ('review', 'index', 'evidence_extract')),
+                    entity_id TEXT NOT NULL REFERENCES events(event_id),
+                    entity_revision INTEGER NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('pending', 'processing', 'completed', 'dead')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    lease_owner TEXT,
+                    lease_expires_ms INTEGER,
+                    available_at_ms INTEGER NOT NULL,
+                    last_error TEXT,
+                    created_ms INTEGER NOT NULL,
+                    updated_ms INTEGER NOT NULL,
+                    UNIQUE (kind, entity_id, entity_revision)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO durable_jobs_new (
+                    job_id, kind, entity_id, entity_revision, state, attempts,
+                    lease_owner, lease_expires_ms, available_at_ms, last_error,
+                    created_ms, updated_ms
+                )
+                SELECT job_id, kind, entity_id, entity_revision, state, attempts,
+                    lease_owner, lease_expires_ms, available_at_ms, last_error,
+                    created_ms, updated_ms
+                FROM durable_jobs
+                """
+            )
+            connection.execute("DROP TABLE durable_jobs")
+            connection.execute("ALTER TABLE durable_jobs_new RENAME TO durable_jobs")
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_durable_jobs_claim
+                    ON durable_jobs(kind, state, available_at_ms, lease_expires_ms, job_id)
+                """
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
     for table, columns in _COLUMN_MIGRATIONS.items():
         known = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
         for name, definition in columns.items():

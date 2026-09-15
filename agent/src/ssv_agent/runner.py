@@ -8,6 +8,7 @@ from deerflow.client import DeerFlowClient
 
 from ssv_agent.prompt import build_review_prompt
 from ssv_agent.review_context import ReviewContext
+from ssv_agent.review_context import RuleRetrievalContext
 
 
 def extract_final_answer(values_data: dict[str, Any]) -> str | None:
@@ -21,7 +22,11 @@ def extract_final_answer(values_data: dict[str, Any]) -> str | None:
     return None
 
 
-def run_review(client: DeerFlowClient, context: ReviewContext) -> str:
+def run_review(
+    client: DeerFlowClient,
+    context: ReviewContext,
+    rule_context: RuleRetrievalContext | None = None,
+) -> str:
     """执行一次复核，返回最终文本；异常向上抛出。"""
     thread_id = f"event-{context.event_id}"
     final_text = ""
@@ -29,7 +34,7 @@ def run_review(client: DeerFlowClient, context: ReviewContext) -> str:
 
     for event in client.stream(
         thread_id=thread_id,
-        message=build_review_prompt(context),
+        message=build_review_prompt(context, rule_context),
     ):
         if event.type == "values":
             answer = extract_final_answer(event.data)

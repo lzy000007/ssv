@@ -7,7 +7,13 @@ import pytest
 from pydantic import ValidationError
 
 from ssv_agent import cli
-from ssv_agent.config import RedisConfig, SsvConfig, load_config
+from ssv_agent.config import (
+    AgentSourceConfig,
+    RecordingEvidenceConfig,
+    RedisConfig,
+    SsvConfig,
+    load_config,
+)
 
 
 def test_load_config_uses_yaml_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -58,6 +64,97 @@ def test_agent_config_evidence_roots_default_empty_and_requires_absolute_paths(
     for invalid in (["relative"], [""], [str(root), "../outside"]):
         with pytest.raises(ValidationError, match="absolute"):
             SsvConfig.model_validate({"agent": {"evidence_roots": invalid}})
+
+
+def test_recording_evidence_requires_a_root_and_valid_window() -> None:
+    with pytest.raises(ValidationError, match="evidence_roots"):
+        SsvConfig.model_validate({"agent": {"recording_evidence": {"enabled": True}}})
+
+    config = SsvConfig.model_validate(
+        {
+            "sources": [
+                {
+                    "id": "camera-01",
+                    "uri": "rtsp://localhost:8554/stream",
+                    "codec": "h264",
+                    "decode": {"mode": "auto"},
+                }
+            ],
+            "agent": {
+                "evidence_roots": ["/var/lib/ssv/evidence"],
+                "recording_evidence": {"enabled": True},
+            },
+        }
+    )
+
+    assert config.sources == [
+        AgentSourceConfig(id="camera-01", uri="rtsp://localhost:8554/stream")
+    ]
+    assert config.agent.recording_evidence == RecordingEvidenceConfig(enabled=True)
+
+    for recording_evidence in (
+        {"enabled": True, "clip_before_ms": 0},
+        {"enabled": True, "clip_after_ms": 0},
+        {"enabled": True, "clip_after_ms": -1},
+        {"enabled": True, "clip_before_ms": 999},
+        {"enabled": True, "clip_after_ms": 999},
+        {"enabled": True, "unknown": True},
+    ):
+        with pytest.raises(ValidationError):
+            SsvConfig.model_validate(
+                {
+                    "agent": {
+                        "evidence_roots": ["/var/lib/ssv/evidence"],
+                        "recording_evidence": recording_evidence,
+                    }
+                }
+            )
+
+
+@pytest.mark.parametrize(
+    "removed_key, removed_value",
+    [
+        ("frame_offsets_ms", [-1000, 0, 1000]),
+        ("poll_interval_ms", 1000),
+        ("lease_ms", 30_000),
+        ("max_retries", 3),
+        ("retry_delay_ms", 2000),
+    ],
+)
+def test_recording_evidence_rejects_removed_keys(
+    removed_key: str, removed_value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        SsvConfig.model_validate(
+            {
+                "agent": {
+                    "evidence_roots": ["/var/lib/ssv/evidence"],
+                    "recording_evidence": {"enabled": True, removed_key: removed_value},
+                }
+            }
+        )
+
+
+def test_recording_evidence_defaults_are_constant() -> None:
+    defaults = RecordingEvidenceConfig()
+
+    assert defaults.enabled is False
+    assert defaults.clip_before_ms == 2500
+    assert defaults.clip_after_ms == 2500
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        {"uri": "rtsp://localhost:8554/stream"},
+        {"id": "camera-01"},
+        {"id": "", "uri": "rtsp://localhost:8554/stream"},
+        {"id": "camera-01", "uri": ""},
+    ],
+)
+def test_agent_sources_require_non_empty_id_and_uri(source: dict[str, str]) -> None:
+    with pytest.raises(ValidationError):
+        SsvConfig.model_validate({"sources": [source]})
 
 
 def test_redis_reclaim_settings_are_strict_and_support_an_optional_consumer_name() -> None:
@@ -119,6 +216,30 @@ agent:
     assert cfg.agent.indexing.enabled is True
     assert cfg.agent.indexing.embedding_backend == "bge_m3"
     assert cfg.agent.indexing.embedding_model == "/models/bge-m3"
+
+
+def test_knowledge_config_has_safe_defaults_and_validates_threshold() -> None:
+    defaults = SsvConfig().agent.knowledge
+    assert defaults.backend == "local_markdown"
+    assert defaults.qdrant_path == "data/qdrant"
+    assert defaults.min_score == 0.5
+
+    configured = SsvConfig.model_validate(
+        {
+            "agent": {
+                "knowledge": {
+                    "backend": "qdrant",
+                    "qdrant_path": "/var/lib/ssv/qdrant",
+                    "min_score": 0.65,
+                }
+            }
+        }
+    )
+    assert configured.agent.knowledge.backend == "qdrant"
+    assert configured.agent.knowledge.min_score == 0.65
+
+    with pytest.raises(ValidationError):
+        SsvConfig.model_validate({"agent": {"knowledge": {"min_score": 1.1}}})
 
 
 def test_load_config_applies_environment_overrides(
@@ -227,6 +348,38 @@ def test_load_config_accepts_complete_example(
     assert cfg.version == "2.0"
     assert cfg.redis.stream_key == "ssv:events"
     assert cfg.agent.max_retries == 3
+
+
+def test_deployment_recording_evidence_defaults_can_be_enabled() -> None:
+    config = SsvConfig.model_validate(
+        {
+            "agent": {
+                "evidence_roots": ["/var/lib/ssv/evidence"],
+                "recording_evidence": {
+                    "enabled": True,
+                    "clip_before_ms": 2500,
+                    "clip_after_ms": 2500,
+                },
+            }
+        }
+    )
+
+    recording_evidence = config.agent.recording_evidence
+    assert recording_evidence.enabled is True
+    assert recording_evidence.clip_before_ms == 2500
+    assert recording_evidence.clip_after_ms == 2500
+
+
+def test_example_recording_evidence_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("REDIS_HOST", raising=False)
+    monkeypatch.delenv("REDIS_PORT", raising=False)
+    example = load_config(Path(__file__).resolve().parents[2] / "config" / "ssv.example.yaml")
+
+    assert example.agent.recording_evidence.enabled is False
+    assert example.agent.recording_evidence.clip_before_ms == 2500
+    assert example.agent.recording_evidence.clip_after_ms == 2500
 
 
 def test_load_config_missing_explicit_path_raises(tmp_path: Path) -> None:

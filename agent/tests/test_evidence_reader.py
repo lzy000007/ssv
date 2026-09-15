@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from pathlib import Path
 
-from ssv_agent.event_store import EventLedger
+from deerflow.config.paths import VIRTUAL_PATH_PREFIX
+from ssv_agent.event_store import EventLedger, JobKind
+from ssv_agent.config import RecordingEvidenceConfig
+from ssv_agent.recording_evidence import RecordingEvidenceArtifact
 from ssv_agent.review_context import ReviewContext
 from ssv_agent.tools.evidence_reader import evidence_reader_tool
 
@@ -36,6 +40,54 @@ def _registered_evidence(tmp_path: Path, monkeypatch) -> tuple[str, Path]:
         case = ledger.get_case("case-1")
     assert case is not None
     return case.evidence[0].evidence_id, frame
+
+
+def _register_derived_context_evidence(tmp_path: Path, monkeypatch) -> list[str]:
+    """登记一个 clip 与三张派生帧，返回四个稳定 evidence_id。"""
+    db_path = tmp_path / "events.db"
+    monkeypatch.setenv("SSV_EVENT_DB_PATH", str(db_path))
+    monkeypatch.setenv("SSV_EVIDENCE_ROOTS", json.dumps([str(tmp_path)]))
+    derived = tmp_path / "derived" / "case-1"
+    derived.mkdir(parents=True)
+    artifacts: list[RecordingEvidenceArtifact] = []
+    for kind, name, mime_type in (
+        ("clip", "context.mp4", "video/mp4"),
+        ("frame", "frame-01.jpg", "image/jpeg"),
+        ("frame", "frame-02.jpg", "image/jpeg"),
+        ("frame", "frame-03.jpg", "image/jpeg"),
+    ):
+        path = derived / name
+        path.write_bytes(name.encode("utf-8"))
+        artifacts.append(
+            RecordingEvidenceArtifact(
+                kind=kind,
+                path=path,
+                mime_type=mime_type,
+                size=path.stat().st_size,
+                mtime=path.stat().st_mtime,
+                sha256=sha256(path.read_bytes()).hexdigest(),
+            )
+        )
+
+    with EventLedger(
+        db_path,
+        evidence_roots=[str(tmp_path)],
+        recording_evidence=RecordingEvidenceConfig(enabled=True),
+    ) as ledger:
+        ledger.record(
+            ReviewContext(
+                event_id="case-1",
+                source="camera-1",
+                timestamp_ms=1000,
+                frame_id=1,
+            )
+        )
+        job = ledger.claim_job(JobKind.EVIDENCE_EXTRACT, "extractor", lease_ms=1000)
+        assert job is not None
+        ledger.complete_evidence_extract_job(job, "extractor", tuple(artifacts))
+        case = ledger.get_case("case-1")
+    assert case is not None
+    return [item.evidence_id for item in case.evidence]
 
 
 def test_evidence_reader_resolves_only_registered_evidence_id(monkeypatch, tmp_path: Path) -> None:
@@ -142,3 +194,26 @@ def test_evidence_reader_rejects_a_registered_file_replaced_by_external_symlink(
     assert out["found"] == []
     assert out["view_image_path"] is None
     assert str(outside) not in json.dumps(out)
+
+
+def test_evidence_reader_copies_all_registered_context_frames_and_clip(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _fake_thread_data(monkeypatch, tmp_path)
+    evidence_ids = _register_derived_context_evidence(tmp_path, monkeypatch)
+
+    payload = json.loads(evidence_reader_tool.func(None, "case-1"))
+
+    assert payload["available"] is True
+    assert {item["evidence_id"] for item in payload["found"]} == set(evidence_ids)
+    assert [item["kind"] for item in payload["found"]].count("clip") == 1
+    assert [item["kind"] for item in payload["found"]].count("frame") == 3
+    assert payload["view_image_path"] is not None
+    serialised = json.dumps(payload)
+    assert str(tmp_path) not in serialised
+    assert "recordings" not in serialised
+    assert all(
+        item["virtual_path"].startswith(f"{VIRTUAL_PATH_PREFIX}/outputs/")
+        for item in payload["found"]
+    )

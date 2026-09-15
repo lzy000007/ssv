@@ -91,6 +91,85 @@ def test_agent_service_starts_and_stops_consumer_and_enabled_workers() -> None:
     assert client.closed is True
 
 
+def test_agent_service_starts_recording_worker_before_review_worker() -> None:
+    order: list[str] = []
+
+    class FakeConsumer:
+        def start(self) -> None:
+            return None
+        def stop(self) -> None:
+            return None
+
+    class FakeWorker:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.started = Event()
+        def run(self, stopping: Event) -> None:
+            order.append(self.name)
+            self.started.set()
+            stopping.wait()
+
+    recording = FakeWorker("recording")
+    review = FakeWorker("review")
+    index = FakeWorker("index")
+    cfg = SsvConfig.model_validate({"sources": [{"id": "camera-1", "uri": "rtsp://host/stream"}], "agent": {"evidence_roots": ["/tmp"], "recording_evidence": {"enabled": True}, "review": {"enabled": True}, "indexing": {"enabled": True}}})
+    runtime = service.AgentService(
+        cfg,
+        consumer_factory=lambda _: FakeConsumer(),
+        recording_evidence_worker_factory=lambda **_: recording,
+        recording_evidence_extractor_factory=lambda **_: object(),
+        review_worker_factory=lambda **_: review,
+        index_worker_factory=lambda **_: index,
+    )
+    runtime.start()
+    runtime.stop(join_timeout_seconds=1)
+    assert order[:3] == ["recording", "review", "index"]
+
+
+def test_recording_factory_receives_config_and_builtin_consumer_ledger_factory() -> None:
+    observed: dict[str, object] = {}
+    class FakeWorker:
+        def run(self, stopping: Event) -> None:
+            stopping.wait()
+    class SpyConsumer:
+        def __init__(self, config, ledger_factory=None):
+            observed["consumer_ledger"] = ledger_factory
+        def start(self):
+            return None
+        def stop(self):
+            return None
+    cfg = SsvConfig.model_validate({"sources": [{"id": "camera-1", "uri": "rtsp://host/stream"}], "agent": {"evidence_roots": ["/tmp"], "recording_evidence": {"enabled": True}}})
+    def extractor_factory(**kwargs):
+        observed["extractor"] = kwargs
+        return object()
+    def worker_factory(**kwargs):
+        observed["worker"] = kwargs
+        return FakeWorker()
+    runtime = service.AgentService(cfg, recording_evidence_worker_factory=worker_factory, recording_evidence_extractor_factory=extractor_factory, consumer_factory=SpyConsumer)
+    runtime.start()
+    runtime.stop(join_timeout_seconds=1)
+    assert observed["extractor"] == {"sources": {"camera-1": cfg.sources[0]}, "config": cfg.agent.recording_evidence, "evidence_roots": ["/tmp"]}
+    worker_args = observed["worker"]
+    assert worker_args["lease_ms"] == service._EVIDENCE_WORKER_LEASE_MS == 30_000
+    assert worker_args["max_retries"] == service._EVIDENCE_WORKER_MAX_RETRIES == 3
+    assert worker_args["retry_delay_ms"] == service._EVIDENCE_WORKER_RETRY_DELAY_MS == 2000
+    assert worker_args["poll_interval_seconds"] == service._EVIDENCE_WORKER_POLL_SECONDS == 1.0
+
+
+def test_builtin_consumer_factory_receives_recording_ledger(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+    class FakeConsumer:
+        def __init__(self, config, ledger_factory=None):
+            observed["ledger_factory"] = ledger_factory
+        def start(self): return None
+        def stop(self): return None
+    monkeypatch.setattr(service, "EventConsumer", FakeConsumer)
+    runtime = service.AgentService(SsvConfig(), consumer_factory=FakeConsumer)
+    runtime.start()
+    runtime.stop(join_timeout_seconds=1)
+    assert callable(observed["ledger_factory"])
+
+
 def test_review_client_is_constructed_with_only_read_only_event_tools() -> None:
     class FakeConsumer:
         def start(self) -> None:
@@ -311,6 +390,9 @@ def test_indexing_uses_same_embedding_settings_as_search_environment(monkeypatch
     monkeypatch.setenv("SSV_EMBEDDING_BACKEND", "operator-backend")
     monkeypatch.setenv("SSV_EMBEDDING_MODEL", "operator-model")
     monkeypatch.setenv("SSV_EVIDENCE_ROOTS", '["/operator/evidence"]')
+    monkeypatch.delenv("SSV_KNOWLEDGE_BACKEND", raising=False)
+    monkeypatch.delenv("SSV_QDRANT_PATH", raising=False)
+    monkeypatch.delenv("SSV_KNOWLEDGE_MIN_SCORE", raising=False)
     cfg = SsvConfig.model_validate(
         {
             "agent": {
@@ -319,7 +401,12 @@ def test_indexing_uses_same_embedding_settings_as_search_environment(monkeypatch
                     "enabled": True,
                     "embedding_backend": "bge_m3",
                     "embedding_model": "/models/bge-m3",
-                }
+                },
+                "knowledge": {
+                    "backend": "qdrant",
+                    "qdrant_path": "custom/qdrant",
+                    "min_score": 0.65,
+                },
             }
         }
     )
@@ -336,6 +423,9 @@ def test_indexing_uses_same_embedding_settings_as_search_environment(monkeypatch
                     os.environ["SSV_EMBEDDING_BACKEND"],
                     os.environ["SSV_EMBEDDING_MODEL"],
                     os.environ["SSV_EVIDENCE_ROOTS"],
+                    os.environ["SSV_KNOWLEDGE_BACKEND"],
+                    os.environ["SSV_QDRANT_PATH"],
+                    os.environ["SSV_KNOWLEDGE_MIN_SCORE"],
                 )
             }
         )
@@ -350,6 +440,9 @@ def test_indexing_uses_same_embedding_settings_as_search_environment(monkeypatch
         "bge_m3",
         "/models/bge-m3",
         '["/configured/evidence"]',
+        "qdrant",
+        str(service._agent_root() / "custom/qdrant"),
+        "0.65",
     )
     assert os.environ["SSV_EMBEDDING_BACKEND"] == "operator-backend"
     assert os.environ["SSV_EMBEDDING_MODEL"] == "operator-model"

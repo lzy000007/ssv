@@ -70,12 +70,21 @@ struct SsvDecodeConfig {
     SsvDecodeDevice device;
 };
 
+struct SsvEventRuleConfig {
+    std::string event_type;
+    std::string severity;
+    std::string rule_id;
+    std::string rule_version;
+    std::string rule_facts_json = "{}";
+};
+
 struct SsvSourceConfig {
     std::string id;
     std::string uri;
     std::string codec = "h264";
     std::string protocols = "tcp";
     int latency_ms = 200;
+    SsvEventRuleConfig event_rule;
     SsvDecodeConfig decode;
 };
 

@@ -98,6 +98,21 @@ def make_consumer(monkeypatch: Any) -> tuple[EventConsumer, FakeRedis]:
     return consumer, fake
 
 
+def test_default_ledger_factory_propagates_recording_evidence_config(monkeypatch: Any, tmp_path: Path) -> None:
+    monkeypatch.setattr("ssv_agent.event_consumer.Redis", lambda **_kwargs: FakeRedis())
+    config = SsvConfig.model_validate(
+        {
+            "agent": {
+                "evidence_roots": [str(tmp_path)],
+                "recording_evidence": {"enabled": True},
+            }
+        }
+    )
+    consumer = EventConsumer(config)
+    factory = consumer._ledger_factory
+    assert getattr(factory, "keywords", {}).get("recording_evidence") == config.agent.recording_evidence
+
+
 def test_valid_event_records_before_ack(monkeypatch: Any) -> None:
     fake_ledger = RecordingLedger()
     fake = FakeRedis()

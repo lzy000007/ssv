@@ -28,6 +28,11 @@ struct _SsvPub {
     gint redis_port;
     gchar *stream_key;
     gint publish_cooldown_ms;
+    gchar *event_type;
+    gchar *severity;
+    gchar *rule_id;
+    gchar *rule_version;
+    gchar *rule_facts_json;
 
     redisContext *redis_ctx;
     std::shared_ptr<SsvSourceMeta> meta_owner;
@@ -43,6 +48,11 @@ enum {
     PROP_REDIS_PORT,
     PROP_STREAM_KEY,
     PROP_PUBLISH_COOLDOWN_MS,
+    PROP_EVENT_TYPE,
+    PROP_SEVERITY,
+    PROP_RULE_ID,
+    PROP_RULE_VERSION,
+    PROP_RULE_FACTS_JSON,
 };
 
 G_DEFINE_TYPE(SsvPub, ssv_pub, GST_TYPE_BASE_TRANSFORM)
@@ -65,6 +75,15 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
 
 std::string
 ssv_pub_build_event_payload(const SsvTrackedFrame &frame, std::int64_t timestamp_ms) {
+    return ssv_pub_build_event_payload(
+        frame, timestamp_ms, ssv::SsvEventRuleConfig {});
+}
+
+std::string
+ssv_pub_build_event_payload(
+    const SsvTrackedFrame &frame,
+    std::int64_t timestamp_ms,
+    const ssv::SsvEventRuleConfig &event_rule) {
     using json = nlohmann::json;
 
     json detections_arr = json::array();
@@ -89,6 +108,14 @@ ssv_pub_build_event_payload(const SsvTrackedFrame &frame, std::int64_t timestamp
         {"frame_id", frame.frame_id},
         {"detections", detections_arr}
     };
+
+    if (!event_rule.event_type.empty()) {
+        msg["event_type"] = event_rule.event_type;
+        msg["severity"] = event_rule.severity;
+        msg["rule_id"] = event_rule.rule_id;
+        msg["rule_version"] = event_rule.rule_version;
+        msg["rule_facts"] = json::parse(event_rule.rule_facts_json);
+    }
 
     return msg.dump();
 }
@@ -240,7 +267,15 @@ ssv_pub_redis_publish(SsvPub *self, const SsvTrackedFrame &frame) {
     if (!self->redis_ctx)
         return;
 
-    std::string payload = ssv_pub_build_event_payload(frame, std::time(nullptr) * 1000LL);
+    ssv::SsvEventRuleConfig event_rule {
+        self->event_type,
+        self->severity,
+        self->rule_id,
+        self->rule_version,
+        self->rule_facts_json,
+    };
+    std::string payload = ssv_pub_build_event_payload(
+        frame, std::time(nullptr) * 1000LL, event_rule);
 
     auto *reply = (redisReply *)redisCommand(self->redis_ctx,
         "XADD %s * event %s",
@@ -347,6 +382,26 @@ ssv_pub_set_property(GObject *object, guint prop_id,
     case PROP_PUBLISH_COOLDOWN_MS:
         self->publish_cooldown_ms = g_value_get_int(value);
         break;
+    case PROP_EVENT_TYPE:
+        g_free(self->event_type);
+        self->event_type = g_value_dup_string(value);
+        break;
+    case PROP_SEVERITY:
+        g_free(self->severity);
+        self->severity = g_value_dup_string(value);
+        break;
+    case PROP_RULE_ID:
+        g_free(self->rule_id);
+        self->rule_id = g_value_dup_string(value);
+        break;
+    case PROP_RULE_VERSION:
+        g_free(self->rule_version);
+        self->rule_version = g_value_dup_string(value);
+        break;
+    case PROP_RULE_FACTS_JSON:
+        g_free(self->rule_facts_json);
+        self->rule_facts_json = g_value_dup_string(value);
+        break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
     }
@@ -375,6 +430,21 @@ ssv_pub_get_property(GObject *object, guint prop_id,
     case PROP_PUBLISH_COOLDOWN_MS:
         g_value_set_int(value, self->publish_cooldown_ms);
         break;
+    case PROP_EVENT_TYPE:
+        g_value_set_string(value, self->event_type);
+        break;
+    case PROP_SEVERITY:
+        g_value_set_string(value, self->severity);
+        break;
+    case PROP_RULE_ID:
+        g_value_set_string(value, self->rule_id);
+        break;
+    case PROP_RULE_VERSION:
+        g_value_set_string(value, self->rule_version);
+        break;
+    case PROP_RULE_FACTS_JSON:
+        g_value_set_string(value, self->rule_facts_json);
+        break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
     }
@@ -388,6 +458,11 @@ ssv_pub_finalize(GObject *object) {
     g_free(self->source_id);
     g_free(self->redis_host);
     g_free(self->stream_key);
+    g_free(self->event_type);
+    g_free(self->severity);
+    g_free(self->rule_id);
+    g_free(self->rule_version);
+    g_free(self->rule_facts_json);
     if (self->redis_ctx)
         redisFree(self->redis_ctx);
     self->meta_owner.reset();
@@ -443,6 +518,32 @@ ssv_pub_class_init(SsvPubClass *klass) {
             (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY |
                           G_PARAM_STATIC_STRINGS)));
 
+    g_object_class_install_property(gobject_class, PROP_EVENT_TYPE,
+        g_param_spec_string("event-type", "Event Type",
+            "Configured event type published with detection events",
+            nullptr, (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY |
+                                   G_PARAM_STATIC_STRINGS)));
+    g_object_class_install_property(gobject_class, PROP_SEVERITY,
+        g_param_spec_string("severity", "Severity",
+            "Configured event severity published with detection events",
+            nullptr, (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY |
+                                   G_PARAM_STATIC_STRINGS)));
+    g_object_class_install_property(gobject_class, PROP_RULE_ID,
+        g_param_spec_string("rule-id", "Rule ID",
+            "Configured rule identifier published with detection events",
+            nullptr, (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY |
+                                   G_PARAM_STATIC_STRINGS)));
+    g_object_class_install_property(gobject_class, PROP_RULE_VERSION,
+        g_param_spec_string("rule-version", "Rule Version",
+            "Configured rule version published with detection events",
+            nullptr, (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY |
+                                   G_PARAM_STATIC_STRINGS)));
+    g_object_class_install_property(gobject_class, PROP_RULE_FACTS_JSON,
+        g_param_spec_string("rule-facts-json", "Rule Facts JSON",
+            "Configured JSON object of rule facts published with detection events",
+            "{}", (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY |
+                                 G_PARAM_STATIC_STRINGS)));
+
     gst_element_class_set_static_metadata(element_class,
         "SSV Redis Publisher",
         "Generic/Video",
@@ -467,6 +568,11 @@ ssv_pub_init(SsvPub *self) {
     self->redis_port = 6379;
     self->stream_key = g_strdup("ssv:events");
     self->publish_cooldown_ms = 30000;
+    self->event_type = nullptr;
+    self->severity = nullptr;
+    self->rule_id = nullptr;
+    self->rule_version = nullptr;
+    self->rule_facts_json = g_strdup("{}");
     self->redis_ctx = nullptr;
     self->meta = nullptr;
     new (&self->track_last_published_ms)

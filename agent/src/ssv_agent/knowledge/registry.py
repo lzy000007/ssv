@@ -12,7 +12,9 @@ _registry: dict[str, tuple[type[Retriever], type[Ingester]]] = {}
 _retriever_instances: dict[str, Retriever] = {}
 _ingester_instances: dict[str, Ingester] = {}
 _LAZY_BACKENDS = {
+    "local_markdown": "ssv_agent.knowledge.backends.local_markdown",
     "mock": "ssv_agent.knowledge.backends.mock",
+    "qdrant": "ssv_agent.knowledge.backends.qdrant",
 }
 
 

@@ -12,6 +12,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from ssv_agent.review_context import RuleRetrievalContext
+
 
 _SAFE_EVENT_ID = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 
@@ -70,6 +72,15 @@ class ReviewClaim(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list)
 
 
+class RuleCitation(BaseModel):
+    """模型对本次规则检索候选的引用。"""
+
+    chunk_id: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    rule_id: str = Field(min_length=1)
+    section: str = Field(min_length=1)
+
+
 class ReviewResult(BaseModel):
     """已通过结构化契约校验的复核结果。"""
 
@@ -78,6 +89,7 @@ class ReviewResult(BaseModel):
     evidence_status: Literal["available", "missing"]
     evidence_ids: list[str] = Field(default_factory=list)
     claims: list[ReviewClaim] = Field(default_factory=list)
+    rule_citations: list[RuleCitation] = Field(default_factory=list)
     explanation: str
     policy_id: str | None = None
     model_id: str | None = None
@@ -98,6 +110,36 @@ class ReviewResult(BaseModel):
 
 class ResultParseError(ValueError):
     """结果模板解析/校验失败。"""
+
+
+def validate_rule_citations(
+    result: ReviewResult,
+    rule_context: RuleRetrievalContext,
+) -> ReviewResult:
+    """校验确定性结论只引用本次检索得到且元数据一致的规则片段。"""
+    if result.verdict == "uncertain":
+        return result
+    if not rule_context.available:
+        raise ResultParseError("规则不可用时结论必须为 uncertain")
+    if not result.rule_citations:
+        raise ResultParseError("确定性结论必须引用规则")
+
+    candidates = {
+        chunk.chunk_id: chunk
+        for chunk in rule_context.chunks
+    }
+    for citation in result.rule_citations:
+        chunk = candidates.get(citation.chunk_id)
+        if chunk is None:
+            raise ResultParseError("规则引用的 chunk 不在本次检索结果中")
+        metadata = chunk.metadata
+        if (
+            citation.source != metadata.get("source")
+            or citation.rule_id != metadata.get("rule_id")
+            or citation.section != metadata.get("section")
+        ):
+            raise ResultParseError("规则引用元数据与检索结果不一致")
+    return result
 
 
 def parse_result_markdown(text: str) -> ReviewResult:

@@ -816,6 +816,11 @@ SsvPipelineInstance SsvPipelineBuilder::build(
                 "redis-port", config.redis.port,
                 "stream-key", config.redis.stream_key.c_str(),
                 "publish-cooldown-ms", config.tracking.publish_cooldown_ms,
+                "event-type", source_config.event_rule.event_type.c_str(),
+                "severity", source_config.event_rule.severity.c_str(),
+                "rule-id", source_config.event_rule.rule_id.c_str(),
+                "rule-version", source_config.event_rule.rule_version.c_str(),
+                "rule-facts-json", source_config.event_rule.rule_facts_json.c_str(),
                 nullptr);
         }
         auto *sink = required_element(

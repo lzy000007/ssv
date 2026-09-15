@@ -35,6 +35,15 @@ sources:
     codec: "h264"
     protocols: "tcp"
     latency_ms: 200
+    event_rule:
+      event_type: "person_without_helmet"
+      severity: "high"
+      rule_id: "GB26860-2011-5.2.2"
+      rule_version: "GB/T 26860-2011"
+      rule_facts:
+        label_semantics:
+          head: "未佩戴安全帽的头部（违规对象）"
+          helmet: "佩戴安全帽的头部（合规人员）"
     decode:
       # auto、vaapi、nvdec 或 software；显式模式不静默回退。
       mode: "auto"
@@ -118,6 +127,12 @@ agent:
   # 空列表保持 fail closed，事件仍会入账但不会获得证据引用。
   evidence_roots: []
   # - "/var/lib/ssv/evidence"
+  # 启用前必须把 evidence_roots 的首项设置为实际的绝对证据目录。
+  recording_evidence:
+    enabled: false
+    # 窗口不得小于 1000：三帧固定在事件的 T-1000ms/T/T+1000ms，窗口更小会让帧落到窗口外。
+    clip_before_ms: 2500
+    clip_after_ms: 2500
   # Redis 只在 SQLite 账本事务提交后 ACK；默认不启动外部模型。
   review:
     enabled: false
@@ -138,3 +153,8 @@ agent:
     embedding_model: null
     # 离线 BGE-M3 示例：embedding_backend: "bge_m3"
     # embedding_model: "/opt/models/bge-m3"
+  # 规则默认使用本地词法检索；切换为 qdrant 前必须完成规则入库并配置真实 embedding。
+  knowledge:
+    backend: "local_markdown"
+    qdrant_path: "data/qdrant"
+    min_score: 0.5

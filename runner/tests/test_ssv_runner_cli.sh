@@ -53,6 +53,13 @@ sources:
   - id: $source_id
     uri: rtsp://127.0.0.1/test
     codec: h264
+    event_rule:
+      event_type: person_without_helmet
+      severity: high
+      rule_id: test-rule
+      rule_version: test-v1
+      rule_facts:
+        subject: person
     decode:
       mode: auto
       device: auto

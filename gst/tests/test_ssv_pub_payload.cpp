@@ -32,13 +32,27 @@ int main()
     object.occluded = true;
     frame.objects.push_back(object);
 
-    const auto payload = ssv_pub_build_event_payload(frame, 1234567890LL);
+    ssv::SsvEventRuleConfig event_rule;
+    event_rule.event_type = "person_without_helmet";
+    event_rule.severity = "high";
+    event_rule.rule_id = "GB26860-2011-5.2.2";
+    event_rule.rule_version = "GB/T 26860-2011";
+    event_rule.rule_facts_json = R"({"helmet_required":true,"subject":"person"})";
+
+    const auto payload = ssv_pub_build_event_payload(
+        frame, 1234567890LL, event_rule);
     const auto message = nlohmann::json::parse(payload);
-    assert(message.size() == 5);
+    assert(message.size() == 10);
     assert(message["type"] == "detection");
     assert(message["source"] == "camera-01");
     assert(message["timestamp_ms"] == 1234567890LL);
     assert(message["frame_id"] == 170);
+    assert(message["event_type"] == "person_without_helmet");
+    assert(message["severity"] == "high");
+    assert(message["rule_id"] == "GB26860-2011-5.2.2");
+    assert(message["rule_version"] == "GB/T 26860-2011");
+    assert(message["rule_facts"] == nlohmann::json({
+        {"helmet_required", true}, {"subject", "person"}}));
     assert(!message.contains("media_pts_ns"));
     assert(!message.contains("stream_generation"));
 

@@ -24,8 +24,10 @@ from ssv_agent.embedding.registry import create_provider
 from ssv_agent.event_consumer import EventConsumer
 from ssv_agent.event_store import EventLedger
 from ssv_agent.event_store.qdrant_store import SsvQdrantStore
+from ssv_agent.recording_evidence import RecordingEvidenceExtractor
+from ssv_agent.knowledge.registry import get_retriever
 from ssv_agent.runner import run_review
-from ssv_agent.workers import IndexWorker, ReviewWorker
+from ssv_agent.workers import IndexWorker, RecordingEvidenceWorker, ReviewWorker
 
 logger = structlog.get_logger()
 
@@ -35,6 +37,10 @@ _REVIEW_TOOL_NAMES = frozenset(
 _REVIEW_CONFIGURED_TOOL_NAMES = _REVIEW_TOOL_NAMES - {"view_image"}
 _REVIEW_VIEW_IMAGE_MODULE = "deerflow.tools.builtins.view_image_tool"
 _ENV_UNSET = object()
+_EVIDENCE_WORKER_POLL_SECONDS = 1.0
+_EVIDENCE_WORKER_LEASE_MS = 30_000
+_EVIDENCE_WORKER_MAX_RETRIES = 3
+_EVIDENCE_WORKER_RETRY_DELAY_MS = 2_000
 _DEERFLOW_ENV_KEYS = (
     "DEER_FLOW_CONFIG_PATH",
     "DEER_FLOW_PROJECT_ROOT",
@@ -61,6 +67,12 @@ def _embedding_settings(config: SsvConfig) -> tuple[str, str | None]:
     """Return the single embedding seam shared with the search tool."""
     indexing = config.agent.indexing
     return indexing.embedding_backend, indexing.embedding_model
+
+
+def _resolve_agent_path(value: str) -> Path:
+    """把 Agent 配置中的路径解析到稳定的 Agent 项目目录。"""
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else _agent_root() / path
 
 
 def _close_resource(resource: object | None) -> None:
@@ -114,6 +126,8 @@ class AgentService:
         consumer_factory: Callable[[SsvConfig], EventConsumer] = EventConsumer,
         review_worker_factory: Callable[..., ReviewWorker] = ReviewWorker,
         index_worker_factory: Callable[..., IndexWorker] = IndexWorker,
+        recording_evidence_worker_factory: Callable[..., RecordingEvidenceWorker] = RecordingEvidenceWorker,
+        recording_evidence_extractor_factory: Callable[..., RecordingEvidenceExtractor] = RecordingEvidenceExtractor,
         client_factory: Callable[[], Any] = DeerFlowClient,
         embedding_factory: Callable[..., Any] = create_provider,
         qdrant_factory: Callable[[], SsvQdrantStore] = SsvQdrantStore,
@@ -122,6 +136,8 @@ class AgentService:
         self._consumer_factory = consumer_factory
         self._review_worker_factory = review_worker_factory
         self._index_worker_factory = index_worker_factory
+        self._recording_evidence_worker_factory = recording_evidence_worker_factory
+        self._recording_evidence_extractor_factory = recording_evidence_extractor_factory
         self._client_factory = client_factory
         self._embedding_factory = embedding_factory
         self._qdrant_factory = qdrant_factory
@@ -145,13 +161,16 @@ class AgentService:
             try:
                 if self._stopping.is_set():
                     return
+                self._start_recording_evidence_worker()
+                if self._stopping.is_set():
+                    return
                 self._start_review_worker()
                 if self._stopping.is_set():
                     return
                 self._start_index_worker()
                 if self._stopping.is_set():
                     return
-                consumer = self._consumer_factory(self._config)
+                consumer = self._create_consumer()
                 # request_stop() deliberately does not take _lifecycle_lock. If
                 # it ran while the factory was executing, own and stop the
                 # consumer before any ingress thread can be created.
@@ -286,10 +305,42 @@ class AgentService:
             poll_interval_seconds=worker_config.poll_interval_ms / 1000,
             policy_id=worker_config.policy_id,
             model_id=worker_config.model_id or self._config.agent.model_name,
+            rule_retriever=get_retriever(self._config.agent.knowledge.backend),
         )
         if self._stopping.is_set():
             return
         self._start_worker_thread("ssv-agent-review", worker.run)
+
+    def _start_recording_evidence_worker(self) -> None:
+        worker_config = self._config.agent.recording_evidence
+        if not worker_config.enabled or self._stopping.is_set():
+            return
+        sources = {source.id: source for source in self._config.sources}
+        extractor = self._recording_evidence_extractor_factory(
+            sources=sources,
+            config=worker_config,
+            evidence_roots=self._config.agent.evidence_roots,
+        )
+        if self._stopping.is_set():
+            return
+        worker = self._recording_evidence_worker_factory(
+            ledger_factory=self._ledger_factory,
+            extractor=extractor,
+            worker_id="ssv-recording-evidence-0",
+            lease_ms=_EVIDENCE_WORKER_LEASE_MS,
+            max_retries=_EVIDENCE_WORKER_MAX_RETRIES,
+            retry_delay_ms=_EVIDENCE_WORKER_RETRY_DELAY_MS,
+            poll_interval_seconds=_EVIDENCE_WORKER_POLL_SECONDS,
+        )
+        if self._stopping.is_set():
+            return
+        self._start_worker_thread("ssv-agent-recording-evidence", worker.run)
+
+    def _create_consumer(self) -> EventConsumer:
+        """让内置 consumer 使用包含 recording 策略的独立账本连接。"""
+        if self._consumer_factory is EventConsumer:
+            return self._consumer_factory(self._config, ledger_factory=self._ledger_factory)
+        return self._consumer_factory(self._config)
 
     def _start_index_worker(self) -> None:
         worker_config = self._config.agent.indexing
@@ -324,7 +375,10 @@ class AgentService:
 
     def _ledger_factory(self) -> EventLedger:
         """为每个 worker 调用创建带同一证据根策略的独立账本连接。"""
-        return EventLedger(evidence_roots=self._config.agent.evidence_roots)
+        return EventLedger(
+            evidence_roots=self._config.agent.evidence_roots,
+            recording_evidence=self._config.agent.recording_evidence,
+        )
 
     def _configure_runtime_environment(self, *, include_deerflow: bool) -> None:
         if include_deerflow:
@@ -340,6 +394,18 @@ class AgentService:
         backend, model = _embedding_settings(self._config)
         self._set_owned_environment("SSV_EMBEDDING_BACKEND", backend)
         self._set_owned_environment("SSV_EMBEDDING_MODEL", model)
+        knowledge = self._config.agent.knowledge
+        knowledge_backend = os.environ.get("SSV_KNOWLEDGE_BACKEND") or knowledge.backend
+        knowledge_path = os.environ.get("SSV_QDRANT_PATH") or knowledge.qdrant_path
+        knowledge_min_score = os.environ.get("SSV_KNOWLEDGE_MIN_SCORE") or str(
+            knowledge.min_score
+        )
+        self._set_owned_environment("SSV_KNOWLEDGE_BACKEND", knowledge_backend)
+        self._set_owned_environment(
+            "SSV_QDRANT_PATH",
+            str(_resolve_agent_path(knowledge_path).resolve()),
+        )
+        self._set_owned_environment("SSV_KNOWLEDGE_MIN_SCORE", knowledge_min_score)
         self._set_owned_environment(
             "SSV_EVIDENCE_ROOTS",
             json.dumps(self._config.agent.evidence_roots),

@@ -24,6 +24,7 @@ class EmbeddingIdentity:
     model: str
     algorithm: str | None = None
     dimensions: int | None = None
+    endpoint: str | None = None
 
     @property
     def adapter_identity_schema_version(self) -> int:
@@ -41,12 +42,14 @@ class EmbeddingIdentity:
             identity["algorithm"] = self.algorithm
         if self.dimensions is not None:
             identity["dimensions"] = self.dimensions
+        if self.endpoint is not None:
+            identity["endpoint"] = self.endpoint
         return identity
 
 
 _registry: dict[str, type[EmbeddingProvider]] = {}
 _instances: dict[str, EmbeddingProvider] = {}
-_configured_instances: dict[tuple[str, str | None], EmbeddingProvider] = {}
+_configured_instances: dict[tuple[str, str | None, str | None], EmbeddingProvider] = {}
 _LAZY_BACKENDS = {
     "bge_m3": "ssv_agent.embedding.backends.bge_m3",
     "mock": "ssv_agent.embedding.backends.mock",
@@ -89,10 +92,12 @@ def resolve_embedding_identity(
             algorithm=MOCK_EMBEDDING_ALGORITHM,
             dimensions=MOCK_EMBEDDING_DIMENSIONS,
         )
+    endpoint = os.getenv("SSV_EMBEDDING_BASE_URL") if effective_backend == "openai_compatible" else None
     return EmbeddingIdentity(
         schema_version=EMBEDDING_IDENTITY_SCHEMA_VERSION,
         backend=effective_backend,
         model=effective_model,
+        endpoint=endpoint,
     )
 
 
@@ -125,7 +130,12 @@ def get_configured_provider(
     _ensure_loaded(backend)
     model_argument = _MODEL_ARGUMENTS.get(backend)
     cache_model = _resolve_model(backend, model) if model_argument is not None else None
-    cache_key = (backend, cache_model)
+    cache_endpoint = (
+        os.getenv("SSV_EMBEDDING_BASE_URL")
+        if backend == "openai_compatible"
+        else None
+    )
+    cache_key = (backend, cache_model, cache_endpoint)
     if cache_key not in _configured_instances:
         kwargs = {model_argument: cache_model} if model_argument and cache_model else {}
         _configured_instances[cache_key] = create_provider(backend, **kwargs)

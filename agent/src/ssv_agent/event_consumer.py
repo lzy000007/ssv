@@ -39,6 +39,7 @@ class EventConsumer:
         self._ledger_factory = ledger_factory or partial(
             EventLedger,
             evidence_roots=config.agent.evidence_roots,
+            recording_evidence=config.agent.recording_evidence,
         )
         self._redis = Redis(
             host=config.redis.host,

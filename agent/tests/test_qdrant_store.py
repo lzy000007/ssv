@@ -270,3 +270,35 @@ def test_upsert_and_search_rule(tmp_path: Path) -> None:
         assert len(hits) == 1
         assert hits[0]["chunk_id"] == "rule-001:1"
         assert hits[0]["rule_id"] == "helmet-001"
+
+
+def test_search_does_not_create_a_missing_collection(tmp_path: Path) -> None:
+    with SsvQdrantStore(tmp_path / "qdrant") as store:
+        assert store.search_rules([0.2] * 64, top_k=1) == []
+        assert not store.collection_exists(store.rule_collection)
+
+
+def test_replace_rule_vectors_removes_stale_points_and_can_clear_index(
+    tmp_path: Path,
+) -> None:
+    with SsvQdrantStore(tmp_path / "qdrant") as store:
+        store.replace_rule_vectors(
+            [
+                ("rule-old", [0.1] * 64, {"source": "rules", "content": "old"}),
+                ("rule-keep", [0.2] * 64, {"source": "rules", "content": "keep"}),
+            ]
+        )
+        store.replace_rule_vectors(
+            [
+                ("rule-keep", [0.2] * 64, {"source": "rules", "content": "keep"}),
+                ("rule-new", [0.3] * 64, {"source": "rules", "content": "new"}),
+            ]
+        )
+
+        assert store.count_points(store.rule_collection) == 2
+        hits = store.search_rules([0.2] * 64, top_k=10)
+        assert {hit["chunk_id"] for hit in hits} == {"rule-keep", "rule-new"}
+
+        store.replace_rule_vectors([])
+        assert store.count_points(store.rule_collection) == 0
+        assert store.search_rules([0.2] * 64, top_k=10) == []

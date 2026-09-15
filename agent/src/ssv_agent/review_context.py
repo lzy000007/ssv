@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import AliasChoices, BaseModel, Field
+
+from ssv_agent.knowledge.schema import Chunk, RetrievalResult
 
 
 class Detection(BaseModel):
@@ -77,4 +80,26 @@ class ReviewContext(BaseModel):
             frame_path=payload.get("frame_path"),
             clip_path=payload.get("clip_path"),
             question=payload.get("question"),
+        )
+
+
+@dataclass(frozen=True)
+class RuleRetrievalContext:
+    """单次复验使用的规则候选，不写入事件权威状态。"""
+
+    query: str
+    result: RetrievalResult
+    chunks: tuple[Chunk, ...]
+    available: bool
+    error_message: str | None = None
+
+    @classmethod
+    def from_result(cls, query: str, result: RetrievalResult) -> "RuleRetrievalContext":
+        available = result.success and bool(result.chunks)
+        return cls(
+            query=query,
+            result=result,
+            chunks=tuple(result.chunks),
+            available=available,
+            error_message=result.error_message,
         )
