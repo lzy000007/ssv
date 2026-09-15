@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdio>
+#include <latch>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -218,17 +219,30 @@ void test_reset_hides_old_generation_and_clears_both_stages()
 void test_concurrent_history_queries_keep_shared_snapshots_alive()
 {
     auto source = initialized_source("camera-01");
+    auto initial = make_detection_frame("camera-01", 0, 1, 0);
+    assert(source->publish_tracked(std::move(initial), make_tracked_objects()) ==
+           SsvMetaResult::Published);
+    assert(source->consume_tracked().result == SsvMetaResult::Consumed);
+
     std::atomic<bool> done = false;
     std::atomic<std::uint64_t> reads = 0;
+    std::latch initial_snapshot_held(1);
     std::thread consumer([&] {
+        auto held = source->latest_tracked_at_or_before(0);
+        assert(held != nullptr && held->frame_id == 0);
+        reads.fetch_add(1, std::memory_order_relaxed);
+        initial_snapshot_held.count_down();
+
         while (!done.load(std::memory_order_acquire)) {
             auto snapshot = source->latest_tracked_at_or_before(
                 1000 * GST_SECOND);
             if (snapshot)
                 reads.fetch_add(1, std::memory_order_relaxed);
         }
+        assert(held->frame_id == 0);
     });
 
+    initial_snapshot_held.wait();
     for (std::uint64_t index = 1; index <= 200; ++index) {
         auto frame = make_detection_frame(
             "camera-01", index * GST_MSECOND, 1, index);
@@ -241,6 +255,7 @@ void test_concurrent_history_queries_keep_shared_snapshots_alive()
     }
     done.store(true, std::memory_order_release);
     consumer.join();
+    assert(source->latest_tracked_at_or_before(0) == nullptr);
     assert(reads.load(std::memory_order_relaxed) > 0);
 }
 
