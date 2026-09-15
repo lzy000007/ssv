@@ -36,10 +36,11 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
         return [item.embedding for item in response.data]
 
     async def embed_query(self, query: str) -> list[float]:
+        query_text_type = os.getenv("SSV_EMBEDDING_QUERY_TEXT_TYPE", "").strip()
         response = await self._client.embeddings.create(
             model=self._model,
             input=[query],
-            extra_body={"text_type": "query"},
+            extra_body={"text_type": query_text_type} if query_text_type else None,
         )
         vectors = [item.embedding for item in response.data]
         if len(vectors) != 1:

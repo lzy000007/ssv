@@ -183,6 +183,7 @@ def test_bge_m3_allows_explicit_online_loading_override(monkeypatch) -> None:
 def test_configured_openai_provider_maps_model(monkeypatch) -> None:
     from ssv_agent.embedding.backends import openai_compatible
 
+    monkeypatch.delenv("SSV_EMBEDDING_QUERY_TEXT_TYPE", raising=False)
     calls: list[tuple[str, list[str]]] = []
 
     class FakeEmbeddings:
@@ -204,7 +205,10 @@ def test_configured_openai_provider_maps_model(monkeypatch) -> None:
     provider = get_configured_provider("openai_compatible", "embedding-model-v2")
 
     assert asyncio.run(provider.embed_query("query")) == [0.1, 0.2]
+    monkeypatch.setenv("SSV_EMBEDDING_QUERY_TEXT_TYPE", "query")
+    assert asyncio.run(provider.embed_query("query")) == [0.1, 0.2]
     assert calls == [
+        ("embedding-model-v2", ["query"], None),
         ("embedding-model-v2", ["query"], {"text_type": "query"}),
     ]
 
