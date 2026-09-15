@@ -31,15 +31,24 @@ class ComposeRedisTest(unittest.TestCase):
             with (
                 patch("scripts.ssv_cli.services.compose._compose", return_value=compose_result) as compose,
                 patch("scripts.ssv_cli.services.compose.RedisConnection", return_value=connection),
+                patch("scripts.ssv_cli.services.compose._qdrant_ready", return_value=True) as ready,
             ):
-                self.assertEqual(start_redis(context, settings), 0)
+                self.assertEqual(
+                    start_redis(context, settings, qdrant_url="http://localhost:7444"),
+                    0,
+                )
 
             compose.assert_called_once_with(
                 context,
                 "up",
                 "-d",
-                environment={"PATH": "/usr/bin", "REDIS_PORT": "6380"},
+                environment={
+                    "PATH": "/usr/bin",
+                    "REDIS_PORT": "6380",
+                    "QDRANT_PORT": "7444",
+                },
             )
+            ready.assert_called_once_with(7444)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Docker Redis lifecycle commands."""
+"""Docker development-service lifecycle commands."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from ..output import header
 from ..services.compose import start_redis, stop_redis
 
 
-def _settings(context: ProjectContext, args: Namespace):
+def _runtime_config(context: ProjectContext, args: Namespace):
     return load_runtime_config(
         context,
         path=getattr(args, "config", None),
@@ -19,14 +19,15 @@ def _settings(context: ProjectContext, args: Namespace):
         db=getattr(args, "db", None),
         stream=getattr(args, "stream_key", None),
         group=getattr(args, "group", None),
-    ).redis
+    )
 
 
 def start(context: ProjectContext, args: Namespace) -> int:
-    header("启动 Docker Redis")
-    return start_redis(context, _settings(context, args))
+    header("启动 Docker Redis 和 Qdrant")
+    runtime = _runtime_config(context, args)
+    return start_redis(context, runtime.redis, qdrant_url=runtime.qdrant_url)
 
 
 def stop(context: ProjectContext, _args: Namespace) -> int:
-    header("停止 Docker Redis")
+    header("停止 Docker Redis 和 Qdrant")
     return stop_redis(context)

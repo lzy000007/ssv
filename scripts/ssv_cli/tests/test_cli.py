@@ -208,25 +208,29 @@ class ContextTest(unittest.TestCase):
     def test_runtime_config_resolves_event_db_like_agent_working_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch.dict(
-                os.environ,
-                {"SSV_CONFIG_PATH": "", "SSV_EVENT_DB_PATH": "custom/events.db"},
-                clear=False,
-            ):
+            config = root / "ssv.yaml"
+            config.write_text(
+                "version: '2.0'\nagent:\n  event_db_path: custom/events.db\n"
+                "  knowledge:\n    qdrant_url: http://localhost:7444\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"SSV_CONFIG_PATH": ""}, clear=False):
                 context = ProjectContext.discover(root)
                 runtime = load_runtime_config(context)
 
         self.assertEqual(runtime.event_db_path, root / "agent" / "custom" / "events.db")
+        self.assertEqual(runtime.qdrant_url, "http://localhost:7444")
 
     def test_runtime_config_preserves_absolute_event_db_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             absolute_path = root / "absolute" / "events.db"
-            with patch.dict(
-                os.environ,
-                {"SSV_CONFIG_PATH": "", "SSV_EVENT_DB_PATH": str(absolute_path)},
-                clear=False,
-            ):
+            config = root / "ssv.yaml"
+            config.write_text(
+                f"version: '2.0'\nagent:\n  event_db_path: {absolute_path.as_posix()}\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"SSV_CONFIG_PATH": ""}, clear=False):
                 context = ProjectContext.discover(root)
                 runtime = load_runtime_config(context)
 

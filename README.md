@@ -81,7 +81,7 @@ cp config/ssv.example.yaml config/ssv.yaml
 
 `--profile` 可选 `auto`、`cpu`、`nvidia`、`intel`、`amd`；选择规则和依赖来源见 [依赖与构建](docs/依赖与构建.md)。
 
-### 4. 启动 Redis 并运行
+### 4. 启动 Redis、Qdrant 并运行
 
 ```bash
 ./ssv redis start
@@ -109,7 +109,7 @@ Agent 是独立进程，需要时另开终端执行：
 | `./ssv run [RUNNER_ARGS]` | 启动 C++ 实时链路 |
 | `./ssv inspect` | 检查 GStreamer 插件是否注册 |
 | `./ssv test` | 编排 Python、C++、Agent 和契约测试 |
-| `./ssv redis start\|stop` | 启动和停止本地 Docker Redis |
+| `./ssv redis start\|stop` | 启动和停止本地 Docker Redis、Qdrant |
 | `./ssv cache status\|clear` | 查看和清空 SSV 运行时缓存 |
 | `./ssv agent [--config PATH]` | 启动 Python Agent |
 | `./ssv model export` | 导出示例 YOLOv8n 原始 ONNX |

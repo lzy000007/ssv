@@ -80,14 +80,14 @@ def build_parser() -> argparse.ArgumentParser:
     clean_parser = commands.add_parser("clean", help="删除 Meson 构建目录")
     clean_parser.set_defaults(handler=clean.run)
 
-    redis_parser = commands.add_parser("redis", help="启动和停止 Docker Redis")
+    redis_parser = commands.add_parser("redis", help="启动和停止 Docker Redis、Qdrant")
     _add_redis_options(redis_parser)
     redis_actions = redis_parser.add_subparsers(dest="redis_action", metavar="ACTION")
     redis_actions.required = True
-    redis_start = redis_actions.add_parser("start", help="启动 Docker Redis")
+    redis_start = redis_actions.add_parser("start", help="启动 Docker Redis、Qdrant")
     _add_redis_options(redis_start)
     redis_start.set_defaults(handler=redis.start)
-    redis_stop = redis_actions.add_parser("stop", help="停止 Docker Redis")
+    redis_stop = redis_actions.add_parser("stop", help="停止 Docker Redis、Qdrant")
     _add_redis_options(redis_stop)
     redis_stop.set_defaults(handler=redis.stop)
 

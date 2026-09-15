@@ -30,6 +30,7 @@ class RuntimeConfig:
     redis: RedisSettings
     event_db_path: Path
     source_path: Path | None = None
+    qdrant_url: str | None = None
 
 
 def _as_mapping(value: Any, name: str) -> dict[str, Any]:
@@ -124,13 +125,21 @@ def load_runtime_config(
         stream_key=stream if stream is not None else settings.stream_key,
         consumer_group=group if group is not None else settings.consumer_group,
     )
-    event_db_value = environment.get("SSV_EVENT_DB_PATH") or "data/events.db"
+    agent_data = _as_mapping(data.get("agent"), "agent")
+    event_db_value = agent_data.get("event_db_path", "data/events.db")
+    if not isinstance(event_db_value, str) or not event_db_value:
+        raise CliError("配置字段 agent.event_db_path 必须是非空字符串")
     event_db_path = Path(event_db_value).expanduser()
     if not event_db_path.is_absolute():
         event_db_path = context.root / "agent" / event_db_path
+    knowledge_data = _as_mapping(agent_data.get("knowledge"), "agent.knowledge")
+    qdrant_url = knowledge_data.get("qdrant_url")
+    if qdrant_url is not None and (not isinstance(qdrant_url, str) or not qdrant_url):
+        raise CliError("配置字段 agent.knowledge.qdrant_url 必须是非空字符串或 null")
 
     return RuntimeConfig(
         redis=_validate_redis(settings),
         event_db_path=event_db_path,
         source_path=source_path,
+        qdrant_url=qdrant_url,
     )
