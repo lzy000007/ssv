@@ -274,6 +274,137 @@ void test_loads_example_config(std::string_view path)
     assert(config.agent.dedup_cooldown_seconds == 30.0F);
 }
 
+void test_accepts_shared_agent_config_fields()
+{
+    ScopedConfigEnvironment environment;
+    const auto valid_path = environment.write("agent-fields.yaml", R"yaml(
+version: "2.0"
+sources:
+  - id: "camera-01"
+    uri: "rtsp://127.0.0.1/test"
+    event_rule:
+      event_type: "person_without_helmet"
+      severity: "high"
+      rule_id: "rule-1"
+      rule_version: "v1"
+      rule_facts: {}
+agent:
+  event_db_path: "data/custom-events.db"
+  indexing:
+    embedding_base_url: "http://127.0.0.1:8080/v1"
+    query_text_type: "query"
+)yaml");
+    static_cast<void>(ssv::ssv_config_load(valid_path.string()));
+
+    const auto empty_query_path = environment.write(
+        "empty-query-text-type.yaml", R"yaml(
+version: "2.0"
+sources:
+  - id: "camera-01"
+    uri: "rtsp://127.0.0.1/test"
+    event_rule:
+      event_type: "person_without_helmet"
+      severity: "high"
+      rule_id: "rule-1"
+      rule_version: "v1"
+      rule_facts: {}
+agent:
+  indexing:
+    query_text_type: ""
+)yaml");
+    static_cast<void>(ssv::ssv_config_load(empty_query_path.string()));
+
+    const auto null_path = environment.write("null-indexing-fields.yaml", R"yaml(
+version: "2.0"
+sources:
+  - id: "camera-01"
+    uri: "rtsp://127.0.0.1/test"
+    event_rule:
+      event_type: "person_without_helmet"
+      severity: "high"
+      rule_id: "rule-1"
+      rule_version: "v1"
+      rule_facts: {}
+agent:
+  indexing:
+    embedding_base_url: null
+    query_text_type: null
+)yaml");
+    static_cast<void>(ssv::ssv_config_load(null_path.string()));
+
+    const auto omitted_path = environment.write("omitted-agent-fields.yaml", R"yaml(
+version: "2.0"
+sources:
+  - id: "camera-01"
+    uri: "rtsp://127.0.0.1/test"
+    event_rule:
+      event_type: "person_without_helmet"
+      severity: "high"
+      rule_id: "rule-1"
+      rule_version: "v1"
+      rule_facts: {}
+agent:
+  indexing:
+    enabled: false
+)yaml");
+    static_cast<void>(ssv::ssv_config_load(omitted_path.string()));
+}
+
+void test_rejects_invalid_event_db_path()
+{
+    struct Case {
+        std::string_view value;
+        ssv::SsvConfigErrorKind kind;
+    };
+    const Case cases[] = {
+        {"\"\"", ssv::SsvConfigErrorKind::InvalidValue},
+        {"null", ssv::SsvConfigErrorKind::InvalidType},
+        {"42", ssv::SsvConfigErrorKind::InvalidType},
+    };
+
+    for (const auto &test_case : cases) {
+        const auto yaml = std::string(R"yaml(
+version: "2.0"
+sources:
+  - id: "camera-01"
+    uri: "rtsp://127.0.0.1/test"
+agent:
+  event_db_path: )yaml") + std::string(test_case.value) + "\n";
+        expect_config_error(
+            yaml, test_case.kind, "agent.event_db_path");
+    }
+}
+
+void test_rejects_invalid_indexing_string_fields()
+{
+    struct Case {
+        std::string_view field;
+        std::string_view value;
+        ssv::SsvConfigErrorKind kind;
+    };
+    const Case cases[] = {
+        {"embedding_base_url", "\"\"", ssv::SsvConfigErrorKind::InvalidValue},
+        {"embedding_base_url", "42", ssv::SsvConfigErrorKind::InvalidType},
+        {"query_text_type", "[]", ssv::SsvConfigErrorKind::InvalidType},
+    };
+
+    for (const auto &test_case : cases) {
+        const auto yaml = std::string(R"yaml(
+version: "2.0"
+sources:
+  - id: "camera-01"
+    uri: "rtsp://127.0.0.1/test"
+agent:
+  indexing:
+    )yaml") + std::string(test_case.field) + ": "
+            + std::string(test_case.value) + "\n";
+        expect_config_error(
+            yaml,
+            test_case.kind,
+            std::string("agent.indexing.") + std::string(test_case.field));
+    }
+}
+
 void test_parses_explicit_preprocess_semantics()
 {
     ScopedConfigEnvironment environment;
@@ -1345,6 +1476,16 @@ redis:
   port: []
 )yaml",
             "redis.port"},
+        {R"yaml(
+version: "2.0"
+sources:
+  - id: "camera-01"
+    uri: "rtsp://127.0.0.1/test"
+agent:
+  knowledge:
+    qdrant_url: 6333
+)yaml",
+            "agent.knowledge.qdrant_url"},
     };
 
     for (const auto &test_case : cases) {
@@ -1409,6 +1550,10 @@ void test_rejects_out_of_range_values()
             "agent.knowledge.backend"},
         {"agent:\n  knowledge:\n    qdrant_path: \"  \"",
             "agent.knowledge.qdrant_path"},
+        {"agent:\n  knowledge:\n    qdrant_url: \"\"",
+            "agent.knowledge.qdrant_url"},
+        {"agent:\n  knowledge:\n    qdrant_url: \"  \"",
+            "agent.knowledge.qdrant_url"},
         {"agent:\n  knowledge:\n    min_score: 1.1",
             "agent.knowledge.min_score"},
         {"tracking:\n  track_buffer: 0", "tracking.track_buffer"},
@@ -1606,6 +1751,9 @@ int main(int argc, char **argv)
 
     test_loads_complete_config();
     test_loads_example_config(argv[1]);
+    test_accepts_shared_agent_config_fields();
+    test_rejects_invalid_event_db_path();
+    test_rejects_invalid_indexing_string_fields();
     test_parses_explicit_preprocess_semantics();
     test_requires_preprocess_when_inference_is_enabled();
     test_parses_cuda_preprocess_execution();

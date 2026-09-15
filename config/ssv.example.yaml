@@ -121,6 +121,8 @@ tracking:
 agent:
   state_machine_timeout: 300
   max_retries: 3
+  event_db_path: "data/events.db"
+  output_dir: "outputs"
   dedup_enabled: true
   dedup_cooldown_seconds: 30.0
   # Redis 中的 frame_path/clip_path 不可信；只有这些绝对根目录内的证据才能登记或被工具复制。
@@ -151,10 +153,14 @@ agent:
     retry_delay_ms: 1000
     embedding_backend: "mock"
     embedding_model: null
+    embedding_base_url: null
+    # 仅兼容服务要求用 text_type 区分查询向量时设置，例如 "query"。
+    query_text_type: null
     # 离线 BGE-M3 示例：embedding_backend: "bge_m3"
     # embedding_model: "/opt/models/bge-m3"
   # 规则默认使用本地词法检索；切换为 qdrant 前必须完成规则入库并配置真实 embedding。
   knowledge:
     backend: "local_markdown"
     qdrant_path: "data/qdrant"
+    qdrant_url: "http://localhost:6333"
     min_score: 0.5

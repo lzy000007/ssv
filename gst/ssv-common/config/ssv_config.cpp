@@ -573,6 +573,8 @@ void validate_indexing_extension(const YAML::Node &node)
         "retry_delay_ms",
         "embedding_backend",
         "embedding_model",
+        "embedding_base_url",
+        "query_text_type",
     });
     validate_worker_common(node, path);
 
@@ -587,6 +589,62 @@ void validate_indexing_extension(const YAML::Node &node)
     }
     validate_optional_string_field(
         node, "embedding_model", "agent.indexing.embedding_model");
+    validate_optional_string_field(
+        node,
+        "embedding_base_url",
+        "agent.indexing.embedding_base_url",
+        true);
+    validate_optional_string_field(
+        node, "query_text_type", "agent.indexing.query_text_type");
+}
+
+void validate_knowledge_extension(const YAML::Node &node)
+{
+    constexpr std::string_view path = "agent.knowledge";
+    require_map(node, path);
+    reject_unknown_keys(node, path, {
+        "backend",
+        "qdrant_path",
+        "qdrant_url",
+        "min_score",
+    });
+
+    const auto backend = get_or<std::string>(
+        node, "backend", "local_markdown", "agent.knowledge.backend");
+    if (backend != "local_markdown"
+        && backend != "qdrant"
+        && backend != "mock") {
+        throw_invalid_value(
+            "agent.knowledge.backend",
+            "agent.knowledge.backend is not supported");
+    }
+
+    const auto qdrant_path = get_or<std::string>(
+        node, "qdrant_path", "data/qdrant", "agent.knowledge.qdrant_path");
+    if (is_blank(qdrant_path)) {
+        throw_invalid_value(
+            "agent.knowledge.qdrant_path",
+            "agent.knowledge.qdrant_path must not be blank");
+    }
+
+    if (const auto qdrant_url = node["qdrant_url"];
+        qdrant_url && !qdrant_url.IsNull()) {
+        const auto value = node_as<std::string>(
+            qdrant_url, "agent.knowledge.qdrant_url");
+        if (is_blank(value)) {
+            throw_invalid_value(
+                "agent.knowledge.qdrant_url",
+                "agent.knowledge.qdrant_url must not be blank");
+        }
+    }
+
+    const auto min_score = get_or<float>(
+        node, "min_score", 0.5F, "agent.knowledge.min_score");
+    if (!std::isfinite(min_score) || min_score < -1.0F || min_score > 1.0F) {
+        throw_invalid_value(
+            "agent.knowledge.min_score",
+            "agent.knowledge.min_score must be between -1 and 1");
+    }
 }
 
 void validate_recording_evidence_extension(const YAML::Node &node)
@@ -613,45 +671,15 @@ void validate_recording_evidence_extension(const YAML::Node &node)
         "agent.recording_evidence.clip_after_ms"));
 }
 
-void validate_knowledge_extension(const YAML::Node &node)
-{
-    constexpr std::string_view path = "agent.knowledge";
-    require_map(node, path);
-    reject_unknown_keys(node, path, {
-        "backend",
-        "qdrant_path",
-        "min_score",
-    });
-
-    const auto backend = get_or<std::string>(
-        node, "backend", "local_markdown", "agent.knowledge.backend");
-    if (backend != "local_markdown"
-        && backend != "qdrant"
-        && backend != "mock") {
-        throw_invalid_value(
-            "agent.knowledge.backend",
-            "agent.knowledge.backend is not supported");
-    }
-
-    const auto qdrant_path = get_or<std::string>(
-        node, "qdrant_path", "data/qdrant", "agent.knowledge.qdrant_path");
-    if (is_blank(qdrant_path)) {
-        throw_invalid_value(
-            "agent.knowledge.qdrant_path",
-            "agent.knowledge.qdrant_path must not be blank");
-    }
-
-    const auto min_score = get_or<float>(
-        node, "min_score", 0.5F, "agent.knowledge.min_score");
-    if (!std::isfinite(min_score) || min_score < -1.0F || min_score > 1.0F) {
-        throw_invalid_value(
-            "agent.knowledge.min_score",
-            "agent.knowledge.min_score must be between -1 and 1");
-    }
-}
-
 void validate_agent_extensions(const YAML::Node &agent)
 {
+    const auto event_db_path = get_or<std::string>(
+        agent, "event_db_path", "data/events.db", "agent.event_db_path");
+    if (event_db_path.empty()) {
+        throw_invalid_value(
+            "agent.event_db_path",
+            "agent.event_db_path must not be empty");
+    }
     if (const auto evidence_roots = agent["evidence_roots"]) {
         constexpr std::string_view path = "agent.evidence_roots";
         require_sequence(evidence_roots, path);
@@ -1539,6 +1567,7 @@ SsvConfig parse_and_validate(const YAML::Node &root)
                 "state_machine_timeout",
                 "max_retries",
                 "model_name",
+                "event_db_path",
                 "output_dir",
                 "dedup_enabled",
                 "dedup_cooldown_seconds",

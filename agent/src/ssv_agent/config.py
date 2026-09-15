@@ -60,6 +60,8 @@ class ReviewWorkerConfig(WorkerConfig):
 class IndexWorkerConfig(WorkerConfig):
     embedding_backend: Literal["mock", "openai_compatible", "bge_m3"] = "mock"
     embedding_model: str | None = None
+    embedding_base_url: str | None = Field(default=None, min_length=1)
+    query_text_type: str | None = None
 
 
 class AgentSourceConfig(_StrictConfigModel):
@@ -82,6 +84,7 @@ class KnowledgeConfig(_StrictConfigModel):
 
     backend: Literal["local_markdown", "qdrant", "mock"] = "local_markdown"
     qdrant_path: str = Field(default="data/qdrant", min_length=1)
+    qdrant_url: str | None = Field(default=None, min_length=1)
     min_score: float = Field(default=0.5, ge=-1.0, le=1.0)
 
 
@@ -89,7 +92,8 @@ class AgentConfig(_StrictConfigModel):
     state_machine_timeout: int = Field(default=300, gt=0)
     max_retries: int = Field(default=3, ge=0)
     model_name: str | None = None
-    output_dir: str = "outputs"
+    event_db_path: str = Field(default="data/events.db", min_length=1)
+    output_dir: str = Field(default="outputs", min_length=1)
     evidence_roots: list[str] = Field(default_factory=list)
     dedup_enabled: bool = True
     dedup_cooldown_seconds: float = Field(default=30.0, gt=0)

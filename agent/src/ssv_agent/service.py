@@ -161,6 +161,7 @@ class AgentService:
             try:
                 if self._stopping.is_set():
                     return
+                self._configure_runtime_environment(include_deerflow=False)
                 self._start_recording_evidence_worker()
                 if self._stopping.is_set():
                     return
@@ -394,18 +395,30 @@ class AgentService:
         backend, model = _embedding_settings(self._config)
         self._set_owned_environment("SSV_EMBEDDING_BACKEND", backend)
         self._set_owned_environment("SSV_EMBEDDING_MODEL", model)
-        knowledge = self._config.agent.knowledge
-        knowledge_backend = os.environ.get("SSV_KNOWLEDGE_BACKEND") or knowledge.backend
-        knowledge_path = os.environ.get("SSV_QDRANT_PATH") or knowledge.qdrant_path
-        knowledge_min_score = os.environ.get("SSV_KNOWLEDGE_MIN_SCORE") or str(
-            knowledge.min_score
+        self._set_owned_environment(
+            "SSV_EMBEDDING_BASE_URL",
+            self._config.agent.indexing.embedding_base_url,
         )
-        self._set_owned_environment("SSV_KNOWLEDGE_BACKEND", knowledge_backend)
+        self._set_owned_environment(
+            "SSV_EMBEDDING_QUERY_TEXT_TYPE",
+            self._config.agent.indexing.query_text_type,
+        )
+        self._set_owned_environment(
+            "SSV_EVENT_DB_PATH",
+            str(_resolve_agent_path(self._config.agent.event_db_path).resolve()),
+        )
+        self._set_owned_environment(
+            "SSV_OUTPUTS_DIR",
+            str(_resolve_agent_path(self._config.agent.output_dir).resolve()),
+        )
+        knowledge = self._config.agent.knowledge
+        self._set_owned_environment("SSV_KNOWLEDGE_BACKEND", knowledge.backend)
         self._set_owned_environment(
             "SSV_QDRANT_PATH",
-            str(_resolve_agent_path(knowledge_path).resolve()),
+            str(_resolve_agent_path(knowledge.qdrant_path).resolve()),
         )
-        self._set_owned_environment("SSV_KNOWLEDGE_MIN_SCORE", knowledge_min_score)
+        self._set_owned_environment("SSV_QDRANT_URL", knowledge.qdrant_url)
+        self._set_owned_environment("SSV_KNOWLEDGE_MIN_SCORE", str(knowledge.min_score))
         self._set_owned_environment(
             "SSV_EVIDENCE_ROOTS",
             json.dumps(self._config.agent.evidence_roots),

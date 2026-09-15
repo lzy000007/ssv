@@ -58,7 +58,8 @@ cp config/ssv.example.yaml config/ssv.yaml
 | `redis.reclaim_idle_ms` | `XAUTOCLAIM` 回收 pending 的最小 idle 时间 |
 | `redis.consumer_name` | 固定 consumer 名称；为空时每个进程生成唯一名称 |
 | `agent.model_name` | review worker 使用的默认模型名 |
-| `agent.output_dir` | 配置模型中的输出目录字段；当前结果写入器实际由 `SSV_OUTPUTS_DIR` 控制，默认 `outputs` |
+| `agent.event_db_path` | SQLite EventLedger 路径 |
+| `agent.output_dir` | 复核结果输出目录 |
 | `agent.evidence_roots` | 允许登记和读取的绝对证据根目录 |
 | `agent.dedup_enabled` / `agent.dedup_cooldown_seconds` | 消费侧冷却去重 |
 | `agent.review` | 复核 worker 的开关、lease、重试和 policy |
@@ -85,8 +86,6 @@ agent:
 ```
 
 `evidence_roots: []` 是 fail closed 配置：事件仍可入账，但 Redis 提供的任意 `frame_path`/`clip_path` 都不会被登记为可读证据。证据根必须是绝对路径，解析后的 symlink 也不能越界。
-
-结果写入路径目前有两个配置面：`agent.output_dir` 会被严格解析，但结果写入器使用 `SSV_OUTPUTS_DIR`；部署时应优先设置后者。这是当前实现边界，不要以为修改 YAML 字段会改变已落盘结果目录。
 
 ## 录像上下文证据
 
@@ -183,32 +182,37 @@ agent:
     enabled: true
     embedding_backend: "bge_m3"
     embedding_model: "/opt/models/bge-m3"
+    embedding_base_url: null
+    query_text_type: null
 ```
 
-`bge_m3` 使用本地文件加载模式，模型目录必须已经存在。代码还支持 `openai_compatible` backend，连接信息通过环境变量提供：
+`bge_m3` 使用本地文件加载模式，模型目录必须已经存在。代码还支持 `openai_compatible` backend，服务地址配置为 `agent.indexing.embedding_base_url`，密钥通过环境变量提供：
 
 ```dotenv
-SSV_EMBEDDING_MODEL=text-embedding-3-small
 SSV_EMBEDDING_API_KEY=replace-me
-SSV_EMBEDDING_BASE_URL=https://api.example.com/v1
 ```
+
+默认发送标准 OpenAI Embeddings 请求。如果兼容服务要求用 `text_type`
+区分查询向量，在 `agent.indexing.query_text_type` 中设置对应值；保持 `null` 时不会发送
+该扩展字段。
 
 规则向量 RAG 与事件语义索引复用 `agent.indexing.embedding_backend` 和
 `agent.indexing.embedding_model`，避免入库和查询使用不同模型。`mock` 只用于测试，不能
 用于 Qdrant 规则 RAG。
 
-Agent 的持久化默认位置和覆盖变量：
+Agent 的持久化默认位置和配置字段：
 
-| 默认位置 | 环境变量 | 内容 |
+| 默认位置 | YAML 字段 | 内容 |
 | --- | --- | --- |
-| `data/events.db` | `SSV_EVENT_DB_PATH` | SQLite EventLedger |
-| `agent/data/qdrant` | `SSV_QDRANT_PATH` | 本地 Qdrant |
-| `outputs` | `SSV_OUTPUTS_DIR` | 复核 JSON 结果 |
-| 本地 Qdrant | `SSV_QDRANT_URL` | 设置后改用 Qdrant 服务 |
-| Qdrant 服务 | `SSV_QDRANT_API_KEY` | 服务认证凭据 |
+| `data/events.db` | `agent.event_db_path` | SQLite EventLedger |
+| `agent/data/qdrant` | `agent.knowledge.qdrant_path` | 本地 Qdrant |
+| `outputs` | `agent.output_dir` | 复核 JSON 结果 |
+| `http://localhost:6333` | `agent.knowledge.qdrant_url` | Docker Qdrant 服务 |
+| 无 | `SSV_QDRANT_API_KEY` | Qdrant 服务认证密钥 |
 
-Qdrant 默认路径固定为 Agent 项目下的 `agent/data/qdrant`，不随当前工作目录变化；设置
-`SSV_QDRANT_PATH` 时可使用绝对路径。其他表中相对路径仍相对于 Agent 进程工作目录解析。
+SQLite、结果目录和 Qdrant 的相对路径都相对于 Agent 项目目录解析，也可在 YAML 中使用绝对路径。
+项目根目录执行 `uv run ./ssv redis start` 会同时启动 Redis 和 Qdrant；Qdrant 数据保存在
+Docker named volume `qdrant-data`，停止或重建容器不会删除该卷。
 
 Qdrant 只保存可重建的语义索引。embedding backend、model 或 schema 变化会产生新的物理 collection 身份；切换模型后需要重新入队 index job，不要把不同模型的向量混写。
 
@@ -218,11 +222,8 @@ Qdrant 只保存可重建的语义索引。embedding backend、model 或 schema 
 规章文件。后端按编号条款切分内容，在内存中检索并最多返回两条带来源的规则片段；规章
 文件修改后会在下一次检索自动重建索引。
 
-当前已放入 `GB+26860-2011 (1).md`。如需临时使用原有固定样例，可在启动 Agent 前设置：
-
-```bash
-export SSV_KNOWLEDGE_BACKEND=mock
-```
+当前已放入 `作业现场安全帽佩戴要求.md` 和 `GB+26860-2011 (1).md`。如需临时使用原有固定样例，将
+`agent.knowledge.backend` 设置为 `"mock"`。
 
 本地规章检索不依赖 Qdrant、embedding 或 index worker。
 
@@ -236,6 +237,7 @@ agent:
   knowledge:
     backend: "qdrant"
     qdrant_path: "data/qdrant"
+    qdrant_url: "http://localhost:6333"
     min_score: 0.5
 ```
 
@@ -269,7 +271,7 @@ docker exec ssv-redis redis-cli XRANGE ssv:events - + COUNT 5
 uv run ./ssv agent
 ```
 
-如果 YAML 修改了 `redis.stream_key`，把 Redis CLI 示例中的 `ssv:events` 换成相同 key。`cache status` 显示该 Stream 的 entries、consumer group pending、Agent 去重 key 数量，以及 SQLite EventLedger 的事件和 durable job 数量；`cache clear` 默认同时清空该 Stream、`ssv:agent:dedup:*` 和 `SSV_EVENT_DB_PATH` 对应的 EventLedger 运行时表，`--dry-run` 只统计、不修改。清理前应停止 `./ssv run` 和 `./ssv agent`，否则新事件可能立即重新写入。清理不会影响 `agent/outputs`、Qdrant、DeerFlow checkpointer、其他 Redis key 或 Docker 容器。
+如果 YAML 修改了 `redis.stream_key`，把 Redis CLI 示例中的 `ssv:events` 换成相同 key。`cache status` 显示该 Stream 的 entries、consumer group pending、Agent 去重 key 数量，以及 SQLite EventLedger 的事件和 durable job 数量；`cache clear` 默认同时清空该 Stream、`ssv:agent:dedup:*` 和 `agent.event_db_path` 对应的 EventLedger 运行时表，`--dry-run` 只统计、不修改。清理前应停止 `./ssv run` 和 `./ssv agent`，否则新事件可能立即重新写入。清理不会影响 `agent/outputs`、Qdrant、DeerFlow checkpointer、其他 Redis key 或 Docker 容器。
 
 Redis 与 SQLite 分别执行，跨存储清理不是原子操作。若某一边失败，命令仍会尝试另一边并返回非零状态；根据输出停止服务后重试 `./ssv cache clear`。
 

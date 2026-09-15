@@ -21,23 +21,31 @@ def _resolve_agent_path(value: str | Path) -> Path:
     return path if path.is_absolute() else _AGENT_ROOT / path
 
 
-def _select_qdrant_path(config: SsvConfig | None, requested: Path | None) -> Path:
-    """按命令行、环境变量、YAML 和默认值的顺序选择 Qdrant 路径。"""
+def _select_qdrant_target(
+    config: SsvConfig | None,
+    requested: Path | None,
+) -> tuple[Path, str | None]:
+    """选择互斥的 Qdrant 本地路径或服务 URL。"""
     if requested is not None:
-        return requested
-    if configured := os.getenv("SSV_QDRANT_PATH"):
-        return Path(configured)
+        return requested, None
     if config is not None:
-        return Path(config.agent.knowledge.qdrant_path)
-    return Path("data/qdrant")
+        knowledge = config.agent.knowledge
+        return Path(knowledge.qdrant_path), knowledge.qdrant_url
+    return Path("data/qdrant"), None
 
 
 def _discover_config() -> Path | None:
-    for candidate in (
-        Path("ssv.yaml"),
-        Path("config/ssv.yaml"),
-        _AGENT_ROOT.parent / "config" / "ssv.yaml",
-    ):
+    candidates = []
+    if env_path := os.getenv("SSV_CONFIG_PATH"):
+        candidates.append(Path(env_path))
+    candidates.extend(
+        (
+            Path("ssv.yaml"),
+            Path("config/ssv.yaml"),
+            _AGENT_ROOT.parent / "config" / "ssv.yaml",
+        )
+    )
+    for candidate in candidates:
         if candidate.is_file():
             return candidate
     return None
@@ -87,8 +95,26 @@ def main() -> None:
         os.environ.pop("SSV_EMBEDDING_MODEL", None)
     else:
         os.environ["SSV_EMBEDDING_MODEL"] = model
-    qdrant_path = _select_qdrant_path(config, args.qdrant_path)
+    embedding_base_url = (
+        config.agent.indexing.embedding_base_url if config is not None else None
+    )
+    if embedding_base_url is None:
+        os.environ.pop("SSV_EMBEDDING_BASE_URL", None)
+    else:
+        os.environ["SSV_EMBEDDING_BASE_URL"] = embedding_base_url
+    query_text_type = (
+        config.agent.indexing.query_text_type if config is not None else None
+    )
+    if query_text_type is None:
+        os.environ.pop("SSV_EMBEDDING_QUERY_TEXT_TYPE", None)
+    else:
+        os.environ["SSV_EMBEDDING_QUERY_TEXT_TYPE"] = query_text_type
+    qdrant_path, qdrant_url = _select_qdrant_target(config, args.qdrant_path)
     os.environ["SSV_QDRANT_PATH"] = str(_resolve_agent_path(qdrant_path).resolve())
+    if qdrant_url is None:
+        os.environ.pop("SSV_QDRANT_URL", None)
+    else:
+        os.environ["SSV_QDRANT_URL"] = qdrant_url
 
     knowledge_dir = (
         _resolve_agent_path(args.knowledge_dir)
@@ -100,7 +126,7 @@ def main() -> None:
         raise SystemExit(result.error_message or "rule ingestion failed")
     print(
         f"ingested rule chunks={result.chunks_count} source={result.document_id} "
-        f"backend={backend} qdrant={os.environ['SSV_QDRANT_PATH']}"
+        f"backend={backend} qdrant={qdrant_url or os.environ['SSV_QDRANT_PATH']}"
     )
 
 
