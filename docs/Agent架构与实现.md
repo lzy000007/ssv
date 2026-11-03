@@ -328,9 +328,15 @@ review JSON 是复核结果的结构化 artifact；SQLite `reviews` 保存不可
 - 跳过 _templates 和隐藏目录。
 - 文件必须有 kind: rule front matter。
 - rule_id + version 是稳定身份，重复身份直接报错。
-- 正文按条款切分，检索结果携带 source、rule_id、rule_version、section、content_hash。
+- 正文按条款切分，检索结果携带 source、rule_id、rule_version、section、content_hash、event_types。
 
-默认 local_markdown backend 在内存中做本地词法检索，文件变化后按 fingerprint 重建。它不依赖 Qdrant，也不需要 embedding。qdrant backend 是可选投影路径，规则入库必须显式执行 knowledge_ingest，不会因为 Agent 启动自动把任意 Markdown 写入向量库。
+默认 local_markdown backend 在内存中做本地词法检索，按完整 RuleDocument 值比较 fingerprint，正文或元数据变化后重建分块及统计。它不依赖 Qdrant，也不需要 embedding。qdrant backend 是可选投影路径，规则入库必须显式执行 knowledge_ingest，不会因为 Agent 启动自动把任意 Markdown 写入向量库。
+
+2026-11-03 的 RAG 收敛保留分块唯一身份、长句长度约束、缓存刷新和两种后端的基础 metadata 一致性。规则仍由 Markdown 保存身份、原文、适用说明和证据边界，不加载独立审核策略；没有规则引擎、checks 输出契约或全目录候选 provider。正文内容由模型结合登记事实和证据判断，通用代码不解释业务前提。
+
+ReviewWorker 只使用本次预检索结果校验引用身份；确定性引用还核对事件已声明的类型。不确定结果也清理不存在或身份不符的引用。没有检索器时执行规则不可用校验，不能绕过约束。结果解析仅将 claims 中已引用的合法证据 ID 汇总去重，非法证据拒绝；租约、重试、内容寻址结果落盘、后续索引和报告流程保持原有职责与所有权。
+
+Qdrant 查询不再扫描规则目录与全量 payload 对账。规则目录或 chunk ID 格式变化需显式重新入库，不自动同步；本地后端下次检索自动刷新。复核 runner 继续显式使用可配置的有限图执行预算，触顶和上游模型服务错误沿用持久任务错误链路。当前规则配置与兼容说明见 [Agent 配置](Agent配置.md)，范围以 [RAG 修改与验收记录](2026-11-03-RAG修改与验收记录.md) 为准。
 
 ### 7.2 复核权限边界
 

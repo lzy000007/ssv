@@ -318,6 +318,7 @@ agent:
     max_retries: 4
     retry_delay_ms: 100
     policy_id: "site-safety.v2"
+    recursion_limit: 384
   indexing:
     enabled: true
     poll_interval_ms: 500
@@ -340,6 +341,7 @@ agent:
 
     assert cfg.agent.review.enabled is True
     assert cfg.agent.review.policy_id == "site-safety.v2"
+    assert cfg.agent.review.recursion_limit == 384
     assert cfg.agent.indexing.enabled is True
     assert cfg.agent.indexing.embedding_backend == "bge_m3"
     assert cfg.agent.indexing.embedding_model == "/models/bge-m3"
@@ -348,6 +350,16 @@ agent:
     assert cfg.agent.reporting.lease_ms == 8000
     assert cfg.agent.reporting.max_retries == 6
     assert cfg.agent.reporting.retry_delay_ms == 250
+
+
+def test_review_step_budget_defaults_to_256() -> None:
+    assert SsvConfig().agent.review.recursion_limit == 256
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True, 256.0, "256", None])
+def test_review_step_budget_rejects_non_positive_or_non_integer_values(invalid) -> None:
+    with pytest.raises(ValidationError, match="recursion_limit"):
+        SsvConfig.model_validate({"agent": {"review": {"recursion_limit": invalid}}})
 
 
 def test_reporting_worker_defaults_enabled_and_rejects_invalid_settings() -> None:

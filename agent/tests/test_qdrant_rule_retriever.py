@@ -6,11 +6,12 @@ from pathlib import Path
 
 import ssv_agent.knowledge.backends.qdrant as qdrant_backend
 from ssv_agent.event_store.qdrant_store import SsvQdrantStore
+from ssv_agent.knowledge.backends.local_markdown import LocalMarkdownRetriever
 from ssv_agent.knowledge.schema import Chunk
 from ssv_agent.tools.rule_retriever import rule_retriever_tool
 
 
-def test_rule_embedding_batches_at_twenty_and_preserves_order(monkeypatch) -> None:
+def test_rule_embedding_batches_at_ten_and_preserves_order(monkeypatch) -> None:
     class RecordingEmbedding:
         def __init__(self) -> None:
             self.calls: list[list[str]] = []
@@ -28,17 +29,21 @@ def test_rule_embedding_batches_at_twenty_and_preserves_order(monkeypatch) -> No
 
     vectors = asyncio.run(qdrant_backend._embed_passages(passages))
 
-    assert [len(batch) for batch in embedding.calls] == [20, 1]
+    assert [len(batch) for batch in embedding.calls] == [10, 10, 1]
     assert vectors == [[float(index)] for index in range(21)]
 
 
 class _SemanticTestEmbedding:
     backend_name = "test-semantic"
 
+    def __init__(self):
+        self.queries = []
+
     async def embed_texts(self, texts: list[str]) -> list[list[float]]:
         return [[1.0, 0.0] if "目标" in text else [0.0, 1.0] for text in texts]
 
     async def embed_query(self, query: str) -> list[float]:
+        self.queries.append(query)
         return [1.0, 0.0] if "目标" in query else [0.0, 1.0]
 
 
@@ -146,3 +151,25 @@ def test_rule_tool_sync_in_existing_event_loop(monkeypatch) -> None:
     result = asyncio.run(invoke())
     assert result["success"] is True
     assert result["chunks"]
+
+
+def test_qdrant_matches_local_chunks_and_preserves_original_query(tmp_path, monkeypatch) -> None:
+    embedding = _configure_test_qdrant(monkeypatch, tmp_path)
+    rules = tmp_path / "rules"
+    rules.mkdir()
+    text = "1.1 目标头部防护用品佩戴要求。" + "目标条款内容。" * 400
+    (rules / "rule.md").write_text(
+        "---\nkind: rule\nrule_id: rule-1\nversion: v1\nevent_type: event-a\n---\n" + text,
+        encoding="utf-8",
+    )
+    local = asyncio.run(LocalMarkdownRetriever(rules).retrieve("目标安全帽", top_k=100))
+    ingested = asyncio.run(qdrant_backend.ingest_rules(rules))
+    result = asyncio.run(qdrant_backend.QdrantRuleRetriever().retrieve("目标安全帽", top_k=100))
+
+    assert ingested.success and ingested.chunks_count == len(local.chunks) > 1
+    assert embedding.queries == ["目标安全帽"]
+    assert {chunk.chunk_id: (chunk.content, chunk.metadata) for chunk in result.chunks} == {
+        chunk.chunk_id: (chunk.content, chunk.metadata) for chunk in local.chunks
+    }
+    assert all(chunk.metadata["event_types"] == ["event-a"] for chunk in result.chunks)
+    assert all("review_policy" not in chunk.metadata for chunk in result.chunks)

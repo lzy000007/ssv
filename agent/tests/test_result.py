@@ -15,7 +15,7 @@ from ssv_agent.result import (
     write_result_json,
     write_result_markdown,
 )
-from ssv_agent.review_context import RuleRetrievalContext
+from ssv_agent.review_context import ReviewContext, RuleRetrievalContext
 
 
 VALID = json.dumps(
@@ -214,3 +214,132 @@ def test_unavailable_rules_only_allow_uncertain() -> None:
         verdict="uncertain", confidence=0.4, rule_citations=[], explanation="没有可用规则依据"
     )
     assert validate_rule_citations(uncertain, context).verdict == "uncertain"
+
+
+def test_parse_completes_registered_claim_evidence_without_changing_observations() -> None:
+    payload = json.loads(VALID)
+    payload["evidence_ids"] = ["evidence-2", "evidence-2"]
+    result = parse_review_result(
+        json.dumps(payload), available_evidence_ids=["evidence-1", "evidence-2", "unused"]
+    )
+    assert result.evidence_ids == ["evidence-2", "evidence-1"]
+    assert result.verdict == "violation"
+    assert result.claims[0].text == payload["claims"][0]["text"]
+
+
+@pytest.mark.parametrize("location", ["summary", "claim"])
+def test_parse_rejects_foreign_evidence_even_during_summary_completion(location) -> None:
+    payload = json.loads(VALID)
+    refs = (
+        payload["evidence_ids"] if location == "summary" else payload["claims"][0]["evidence_ids"]
+    )
+    refs.append("foreign")
+    with pytest.raises(ResultParseError, match="未登记或不可用"):
+        parse_review_result(json.dumps(payload), available_evidence_ids=["evidence-1"])
+
+
+def test_parse_without_evidence_context_keeps_strict_summary_contract() -> None:
+    payload = json.loads(VALID)
+    payload["evidence_ids"] = []
+    with pytest.raises(ResultParseError):
+        parse_review_result(json.dumps(payload))
+    assert parse_review_result(
+        json.dumps(payload), available_evidence_ids=["evidence-1"]
+    ).evidence_ids == ["evidence-1"]
+
+
+def test_legacy_markdown_cannot_bypass_evidence_ownership() -> None:
+    with pytest.raises(ResultParseError, match="未登记或不可用"):
+        parse_review_result(LEGACY_UNCERTAIN + "\n证据ID: foreign", available_evidence_ids=[])
+
+
+@pytest.mark.parametrize("verdict", ["violation", "compliant"])
+def test_plain_rule_result_needs_no_policy_or_checks(verdict) -> None:
+    chunk = Chunk(
+        chunk_id="chunk-1",
+        content="规则正文",
+        score=0.9,
+        metadata={
+            "source": "rules.md",
+            "rule_id": "rule-1",
+            "rule_version": "v1",
+            "section": "5.2",
+            "event_types": ["event-a"],
+        },
+    )
+    event = ReviewContext(
+        event_id="e", source="camera", timestamp_ms=1, frame_id=1, event_type="event-a"
+    )
+    result = validate_rule_citations(_rule_result(verdict=verdict), _context(chunk), event)
+    assert result.verdict == verdict
+    assert "checks" not in result.rule_citations[0].model_dump()
+
+
+@pytest.mark.parametrize(
+    "event_type, expected",
+    [("event-a", "violation"), ("event-b", "uncertain"), (None, "violation")],
+)
+def test_citation_event_type_matches_retrieved_metadata(event_type, expected) -> None:
+    chunk = Chunk(
+        chunk_id="chunk-1",
+        content="规则",
+        score=0.9,
+        metadata={
+            "source": "rules.md",
+            "rule_id": "rule-1",
+            "rule_version": "v1",
+            "section": "5.2",
+            "event_types": ["event-a"],
+        },
+    )
+    event = ReviewContext(
+        event_id="e", source="camera", timestamp_ms=1, frame_id=1, event_type=event_type
+    )
+    assert validate_rule_citations(_rule_result(), _context(chunk), event).verdict == expected
+
+
+def test_uncertain_result_keeps_matching_citation_and_removes_unknown_one() -> None:
+    chunk = Chunk(
+        chunk_id="chunk-1",
+        content="规则",
+        score=0.9,
+        metadata={
+            "source": "rules.md",
+            "rule_id": "rule-1",
+            "rule_version": "v1",
+            "section": "5.2",
+        },
+    )
+    result = _rule_result(verdict="uncertain", confidence=0.3)
+    wrong = result.rule_citations[0].model_copy(update={"source": "invented.md"})
+    result.rule_citations.append(wrong)
+    checked = validate_rule_citations(result, _context(chunk))
+    assert len(checked.rule_citations) == 1
+    assert checked.rule_citations[0].source == "rules.md"
+    assert checked.verdict == "uncertain" and checked.confidence == 0.3
+    assert "已移除 1 条" in checked.explanation
+
+
+def test_historical_checks_do_not_become_a_required_output_contract() -> None:
+    payload = _rule_result().model_dump()
+    payload["rule_citations"][0]["checks"] = [{"requirement_id": "old-field"}]
+    result = parse_review_result(json.dumps(payload))
+    assert result.rule_citations[0].chunk_id == "chunk-1"
+    assert "checks" not in result.rule_citations[0].model_dump()
+
+
+def test_failed_retrieval_cannot_authorize_citations_from_its_partial_chunks() -> None:
+    chunk = Chunk(
+        chunk_id="chunk-1",
+        content="规则",
+        score=0.9,
+        metadata={
+            "source": "rules.md",
+            "rule_id": "rule-1",
+            "rule_version": "v1",
+            "section": "5.2",
+        },
+    )
+    result = validate_rule_citations(_rule_result(), _context(chunk, available=False))
+    assert result.verdict == "uncertain"
+    assert result.rule_citations == []

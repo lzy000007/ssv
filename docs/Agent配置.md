@@ -73,6 +73,7 @@ cp config/ssv.example.yaml config/ssv.yaml
 | `agent.evidence_roots` | 允许登记和读取的绝对证据根目录 |
 | `agent.dedup_enabled` / `agent.dedup_cooldown_seconds` | 消费侧冷却去重 |
 | `agent.review` | 复核 worker 的开关、lease、重试和 policy |
+| `agent.review.recursion_limit` | 单次复核图节点执行步数上限，严格正整数，默认 256 |
 | `agent.indexing` | embedding/index worker 的开关、lease、重试和 backend |
 | `agent.reporting` | 报告 worker 的开关、轮询、lease 和重试配置 |
 
@@ -272,6 +273,7 @@ agent:
     - "/var/lib/ssv/evidence-cache"
   review:
     enabled: true
+    recursion_limit: 256
     poll_interval_ms: 1000
     lease_ms: 30000
     max_retries: 3
@@ -280,6 +282,8 @@ agent:
 ```
 
 每次 review client 启动时，服务会从 `agent/config.yaml`（不存在时回退到 `agent/config.example.yaml`）生成临时配置，并启用 fail-closed RBAC。可用工具固定为 `get_event`、`get_report`、`evidence_reader`、`sample_video`、`rule_retriever`、`search_events` 和 DeerFlow 内置 `view_image`；skills、subagent 和 plan mode 不进入该复核 worker。
+
+`agent.review.recursion_limit` 限制一次复核的 LangGraph 节点执行步数，包括模型、工具和中间件节点；它不是 Python 调用栈深度、模型请求次数、token 或秒数。SSV 显式使用默认 256，避免 DeerFlow 默认 100 步在正常逐帧取证流程中过早耗尽。达到上限会记录 `review_step_limit_exceeded`，不采用中间输出；任务继续遵循已有重试策略。排查时先检查工具是否重复调用，再根据正常取证所需轮次调整配置；runner 不会自动放宽上限。此设置不改变 DeerFlow 的循环检测、结果校验和租约机制。
 
 启用前检查：
 
@@ -352,6 +356,7 @@ Qdrant 只保存可重建的语义索引。embedding backend、model 或 schema 
 agent/knowledge/rules/_templates/rule.md
 agent/knowledge/rules/gb26860-helmet/v1/rule.md
 agent/knowledge/rules/gb26860-helmet/v2/rule.md
+agent/knowledge/rules/site-helmet/v1/rule.md
 ```
 
 每个规则文件的正文前使用 YAML front matter：
@@ -367,8 +372,8 @@ aliases: [安全帽]
 ---
 ```
 
-检索 chunk 会携带相对于 `rules_dir` 的 `source`、`rule_id`、`rule_version`、`section` 和
-`content_hash`；front matter 不会被当作规则正文。`rule_retriever` 支持 `source`、`rule_id`、
+检索 chunk 会携带相对于 `rules_dir` 的 `source`、`rule_id`、`rule_version`、`section`、
+`content_hash` 和 `event_types`；front matter 不会被当作规则正文。`rule_retriever` 支持 `source`、`rule_id`、
 `rule_version` 和 `event_type` 过滤。事件同时带有完整 `rule_id + rule_version` 时，复核链路
 进行精确版本过滤；没有规则引用时只根据检测事实召回候选，不把传输层 `type: detection`
 伪装成业务事件类型。
@@ -401,16 +406,29 @@ uv sync --extra dev --extra bge-m3
 uv run --extra bge-m3 python -m ssv_agent.knowledge_ingest --config ../config/ssv.yaml
 ```
 
-入库命令会按最多 20 条文本调用 embedding，成功后只保留当前规则目录对应的 chunk，并保留
+入库命令会按最多 10 条文本调用 embedding，成功后只保留当前规则目录对应的 chunk，并保留
 `rule_version`、`content_hash` 和事件类型 metadata。规则目录没有有效版本化文档、目录不存在
 或 embedding 失败会返回错误；不会把旧顶层 `agent/knowledge/` 文件静默混入索引。未创建或为空的 Qdrant
 索引会显式报告为不可用，不会返回随机条款。`min_score` 用于过滤低相似度结果，没有达到
 阈值时返回“无知识依据”。
 
-复核结果 JSON 的确定性结论还会写入 `rule_citations`，每项包含 `chunk_id`、`source`、
-`rule_id`、`rule_version` 和 `section`。这些字段必须与本次预检索实际返回的规则片段一致；
-prompt 同时展示 `content_hash` 供人工核对。没有可用规则、规则检索失败或引用版本不一致时，
-结果只能是 `uncertain`。
+复核结果 JSON 使用基础 `rule_citations`：`chunk_id`、`source`、`rule_id`、`rule_version` 和 `section` 必须与本次预检索实际返回的片段一致。确定性结论缺少可用规则或引用身份不符时降为 `uncertain`；事件声明 `event_type` 时，被引用规则的 `event_types` 必须包含该类型。不确定结果中的无法核对引用会被删除。未配置检索器时同样按规则不可用处理，不通过全目录候选兜底。
+
+### RAG 修复与规则内容
+
+2026-11-03 起，规则仍使用带 front matter 的 Markdown，不需要独立 `review.yaml`。检索层只返回相关正文和基础 metadata，不解释行业事实或逐项业务判定策略。模型结合规则正文、事件 `rule_facts` 与已登记证据判断适用性，不能补造事实；项目示例不能替代正式依据，未发现违规不等于确认合规。当前实现不再输出或要求 `rule_citations[].checks`，历史 JSON 中的额外字段仍可读取。
+
+本地 `local_markdown` 使用完整 `RuleDocument` 值刷新缓存：正文、身份、事件类型等元数据变化后，下次检索重建分块及检索统计。本地与 Qdrant 返回一致的 `source`、`rule_id`、`rule_version`、`section`、`content_hash`、`event_types`。查询保持原意，不自动把安全帽扩展为绝缘安全帽，也不强制按该关键词过滤正文。
+
+规则分块长度上限为 1200 字符，单句超长也切分。chunk ID 包含来源、规则身份、版本、条款、正文哈希、条款内序号与分块哈希；同条款的不同分段和重复正文不会互相覆盖，不再包含审核策略哈希。
+
+Qdrant 是显式维护的规则投影：规则正文或元数据修改后必须重新执行前述 `knowledge_ingest` 命令。本次从含策略哈希版本切换时，也须在新 Agent 启动前重新入库。查询不扫描规则目录或全索引 payload，不自动判断索引陈旧、不自动入库。不存在或为空的 collection 仍明确报告不可用；入库保留原有重建和旧 point 清理行为，每批最多 10 条文本。
+
+保留 `site-helmet/v1/rule.md`，当前已绑定该身份的视频源无需更换规则 ID。现场佩戴要求、`helmet_required_area=confirmed` 的适用事实、违规/合规与不可观察条件保留在正文。`gb26860-helmet/v1` 的项目示例性质和 `v2` 的标准摘录边界也保留在正文；这些内容不是新的程序判定接口。
+
+复核 worker 将本事件可用证据 ID 集合传给结果解析器。顶层 `evidence_ids` 可从模型已输出的 claims 引用补齐并去重，未知或其他事件的证据 ID 仍拒绝；不会生成新观察或补造事实。没有传入可用集合的独立解析调用保持原有严格汇总契约，历史 Markdown 同样检查证据归属。
+
+收敛范围、实施计划、历史方案替代关系及真实视频验收统一记录在 [RAG 修改与验收记录](2026-11-03-RAG修改与验收记录.md)。历史方案在该文档中单独归档，不代表当前实现。
 
 ## 运行时缓存与 Redis 运维
 

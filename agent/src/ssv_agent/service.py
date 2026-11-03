@@ -262,7 +262,11 @@ class AgentService:
             return
         worker = self._review_worker_factory(
             ledger_factory=self._ledger_factory,
-            runner=partial(run_review, self._deerflow_client),
+            runner=partial(
+                run_review,
+                self._deerflow_client,
+                recursion_limit=worker_config.recursion_limit,
+            ),
             worker_id="ssv-review-0",
             lease_ms=worker_config.lease_ms,
             max_retries=worker_config.max_retries,

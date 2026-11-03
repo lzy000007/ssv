@@ -35,6 +35,7 @@ from ssv_agent.result import (
 from ssv_agent.runner import ModelCallError, classify_model_error
 from ssv_agent.search.rule_query import build_rule_filters, build_rule_query
 from ssv_agent.knowledge import Retriever
+from ssv_agent.knowledge.schema import RetrievalResult
 from ssv_agent.search.event_text import build_event_text
 
 logger = structlog.get_logger()
@@ -311,9 +312,13 @@ class ReviewWorker(_PollingWorker):
                 heartbeat.start()
                 heartbeat.checkpoint()
                 review_context = case.to_review_context()
-                rule_context = None
+                query = build_rule_query(case)
+                retrieval = RetrievalResult(
+                    query=query,
+                    success=False,
+                    error_message="未配置规则检索器",
+                )
                 if self._rule_retriever is not None:
-                    query = build_rule_query(case)
                     filters = build_rule_filters(case)
                     try:
                         retrieval = self._rule_retriever.retrieve(
@@ -324,15 +329,13 @@ class ReviewWorker(_PollingWorker):
                         if inspect.isawaitable(retrieval):
                             retrieval = asyncio.run(retrieval)
                     except Exception as exc:
-                        from ssv_agent.knowledge.schema import RetrievalResult
-
                         retrieval = RetrievalResult(
                             query=query,
                             backend="",
                             success=False,
                             error_message=type(exc).__name__,
                         )
-                    rule_context = RuleRetrievalContext.from_result(query, retrieval)
+                rule_context = RuleRetrievalContext.from_result(query, retrieval)
                 try:
                     try:
                         text = self._runner(review_context, rule_context)
@@ -348,9 +351,14 @@ class ReviewWorker(_PollingWorker):
                         "模型服务未返回可解析结果。",
                     )
                 heartbeat.checkpoint()
-                result = parse_review_result(text)
-                if rule_context is not None:
-                    result = validate_rule_citations(result, rule_context)
+                result = parse_review_result(
+                    text, available_evidence_ids=review_context.evidence_ids
+                )
+                result = validate_rule_citations(
+                    result,
+                    rule_context,
+                    review_context,
+                )
                 result = self._add_provenance(result)
                 heartbeat.checkpoint()
                 result_path = self._result_writer(case.event_id, result)

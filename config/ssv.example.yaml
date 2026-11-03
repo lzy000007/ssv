@@ -121,6 +121,7 @@ agent:
     max_episode_ms: 30000
   review:
     enabled: false
+    recursion_limit: 256
     poll_interval_ms: 1000
     lease_ms: 30000
     max_retries: 3

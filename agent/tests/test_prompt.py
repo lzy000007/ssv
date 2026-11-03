@@ -62,3 +62,13 @@ def test_prompt_includes_rule_candidates_and_requires_rule_citations() -> None:
     assert "sha256:abc" in prompt
     assert "rule_citations" in prompt
     assert "规则候选核验" in prompt
+
+
+def test_prompt_uses_plain_rules_and_preserves_visual_evidence_boundaries() -> None:
+    context = ReviewContext(event_id="e", source="camera", timestamp_ms=1, frame_id=1)
+    prompt = build_review_prompt(context)
+    assert "本次预检索候选" in prompt
+    assert "近似时间定位不否定画面中清晰可见的事实" in prompt
+    assert "未发现违规不等于确认合规" in prompt
+    assert "不得声称它们是检测帧" in prompt
+    assert "review_policy" not in prompt and '"checks"' not in prompt

@@ -65,6 +65,7 @@ class WorkerConfig(PollingWorkerConfig):
 class ReviewWorkerConfig(WorkerConfig):
     policy_id: str = "ssv-review.v1"
     model_id: str | None = None
+    recursion_limit: int = Field(default=256, ge=1)
 
 
 class IndexWorkerConfig(WorkerConfig):
@@ -275,7 +276,7 @@ def load_sources() -> list[dict[str, Any]]:
     """读取配置文件中的 sources 列表，供 source_list 工具使用。"""
     for path in _config_search_paths():
         if path.exists():
-            with open(path) as f:
+            with open(path, encoding="utf-8-sig") as f:
                 data = yaml.safe_load(f) or {}
             return list(data.get("sources", []))
     return []
@@ -292,7 +293,7 @@ def load_config(path: str | Path | None = None) -> SsvConfig:
     if path is not None:
         p = Path(path)
         if p.exists():
-            with open(p) as f:
+            with open(p, encoding="utf-8-sig") as f:
                 data = yaml.safe_load(f) or {}
             cfg = _validate_loaded_config(data)
         else:
@@ -301,21 +302,21 @@ def load_config(path: str | Path | None = None) -> SsvConfig:
     if cfg is None:
         env_path = os.environ.get("SSV_CONFIG_PATH")
         if env_path and Path(env_path).exists():
-            with open(env_path) as f:
+            with open(env_path, encoding="utf-8-sig") as f:
                 data = yaml.safe_load(f) or {}
             cfg = _validate_loaded_config(data)
 
     if cfg is None:
         local = Path("ssv.yaml")
         if local.exists():
-            with open(local) as f:
+            with open(local, encoding="utf-8-sig") as f:
                 data = yaml.safe_load(f) or {}
             cfg = _validate_loaded_config(data)
 
     if cfg is None:
         config_local = Path("config/ssv.yaml")
         if config_local.exists():
-            with open(config_local) as f:
+            with open(config_local, encoding="utf-8-sig") as f:
                 data = yaml.safe_load(f) or {}
             cfg = _validate_loaded_config(data)
 

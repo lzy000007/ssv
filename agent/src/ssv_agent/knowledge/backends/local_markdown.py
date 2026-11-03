@@ -11,6 +11,7 @@ from typing import Any
 
 from ssv_agent.knowledge.catalog import (
     DEFAULT_RULES_DIR,
+    RuleDocument,
     discover_rule_documents,
 )
 from ssv_agent.knowledge.ingester import Ingester
@@ -18,6 +19,7 @@ from ssv_agent.knowledge.registry import register_backend
 from ssv_agent.knowledge.rule_chunks import (
     RulePassage,
     rule_chunk_id,
+    rule_chunk_metadata,
     split_rule_clauses,
 )
 from ssv_agent.knowledge.retriever import Retriever
@@ -47,7 +49,7 @@ class LocalMarkdownRetriever(Retriever):
             if knowledge_dir is not None
             else Path(configured_dir) if configured_dir else DEFAULT_RULES_DIR
         )
-        self._fingerprint: tuple[tuple[str, str], ...] = ()
+        self._fingerprint: tuple[RuleDocument, ...] = ()
         self._passages: list[RulePassage] = []
         self._term_frequencies: list[Counter[str]] = []
         self._document_frequencies: Counter[str] = Counter()
@@ -64,8 +66,6 @@ class LocalMarkdownRetriever(Retriever):
             raise ValueError("top_k must be at least 1")
         self._reload_if_changed()
 
-        if "安全帽" in query and "绝缘安全帽" not in query:
-            query = f"{query} 绝缘安全帽"
         terms = set(_tokens(query))
         active_filters = filters or {}
         source_filter = active_filters.get("source")
@@ -118,13 +118,7 @@ class LocalMarkdownRetriever(Retriever):
                 chunk_id=rule_chunk_id(self._passages[index]),
                 content=self._passages[index].content,
                 score=round(score, 4),
-                metadata={
-                    "source": self._passages[index].source,
-                    "rule_id": self._passages[index].rule_id,
-                    "rule_version": self._passages[index].rule_version,
-                    "section": self._passages[index].section,
-                    "content_hash": self._passages[index].content_hash,
-                },
+                metadata=rule_chunk_metadata(self._passages[index]),
             )
             for score, index in ranked
         ]
@@ -132,9 +126,8 @@ class LocalMarkdownRetriever(Retriever):
 
     def _reload_if_changed(self) -> None:
         documents = discover_rule_documents(self._knowledge_dir)
-        fingerprint = tuple(
-            (document.source_path, document.content_hash) for document in documents
-        )
+        # 正文不变时，规则身份和适用事件等元数据也可能单独修订。
+        fingerprint = documents
         if fingerprint == self._fingerprint:
             return
 

@@ -20,7 +20,8 @@ from ssv_agent.knowledge.rule_chunks import rule_chunk_id, split_rule_clauses
 from ssv_agent.knowledge.retriever import Retriever
 from ssv_agent.knowledge.schema import Chunk, IngestResult, RetrievalResult
 
-MAX_EMBEDDING_BATCH_SIZE = 20
+# 当前使用的 text-embedding-v4 兼容接口最多接受 10 条文本。
+MAX_EMBEDDING_BATCH_SIZE = 10
 MAX_RULE_TOP_K = 100
 DEFAULT_MIN_SCORE = 0.5
 
@@ -41,13 +42,6 @@ def _embedding_provider():
             "configure bge_m3 or openai_compatible"
         )
     return provider
-
-
-def _expand_rule_query(query: str) -> str:
-    """补充规则文档中的领域术语，降低中文简称造成的召回偏差。"""
-    if "安全帽" in query and "绝缘安全帽" not in query:
-        return f"{query} 绝缘安全帽"
-    return query
 
 
 def _normalize_rule_filters(filters: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -176,7 +170,7 @@ class QdrantRuleRetriever(Retriever):
         if top_k < 1 or top_k > MAX_RULE_TOP_K:
             raise ValueError(f"top_k must be between 1 and {MAX_RULE_TOP_K}")
         provider = _embedding_provider()
-        vector = await provider.embed_query(_expand_rule_query(query))
+        vector = await provider.embed_query(query)
         if not vector or any(not math.isfinite(value) for value in vector):
             raise ValueError("query embedding vector must be non-empty and finite")
         min_score = _min_score()
@@ -203,8 +197,6 @@ class QdrantRuleRetriever(Retriever):
                 filters=_normalize_rule_filters(filters),
             )
         hits = [hit for hit in hits if float(hit.get("score", -1.0)) >= min_score]
-        if "安全帽" in query:
-            hits = [hit for hit in hits if "安全帽" in str(hit.get("content", ""))]
         chunks = [
             Chunk(
                 chunk_id=str(hit["chunk_id"]),
@@ -216,6 +208,7 @@ class QdrantRuleRetriever(Retriever):
                     "rule_version": hit.get("rule_version", ""),
                     "section": hit.get("section", ""),
                     "content_hash": hit.get("content_hash", ""),
+                    "event_types": hit.get("event_types", []),
                 },
             )
             for hit in hits

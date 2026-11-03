@@ -6,12 +6,14 @@ import os
 import signal
 from pathlib import Path
 from threading import Event, Thread
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from ssv_agent import service
 from ssv_agent.config import SsvConfig
+from ssv_agent.review_context import ReviewContext
 from ssv_agent.review_runtime import validate_review_view_image_tool
 
 
@@ -452,6 +454,56 @@ def test_review_client_is_constructed_with_only_read_only_event_tools() -> None:
             },
         },
     }
+
+
+@pytest.mark.parametrize(
+    "review_settings, expected_limit", [({}, 256), ({"recursion_limit": 384}, 384)]
+)
+def test_review_worker_passes_step_budget_to_client_stream(review_settings, expected_limit) -> None:
+    class FakeConsumer:
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class FakeWorker:
+        def run(self, stopping: Event) -> None:
+            stopping.wait()
+
+    class FakeClient:
+        def stream(self, **kwargs):
+            assert kwargs["recursion_limit"] == expected_limit
+            yield SimpleNamespace(
+                type="values", data={"messages": [{"type": "ai", "content": "answer"}]}
+            )
+
+    observed = {}
+
+    def create_review_worker(**kwargs):
+        observed["runner"] = kwargs["runner"]
+        return FakeWorker()
+
+    cfg = SsvConfig.model_validate(
+        {"agent": {"review": {"enabled": True, **review_settings}, "reporting": {"enabled": False}}}
+    )
+    runtime = service.AgentService(
+        cfg,
+        consumer_factory=lambda _: FakeConsumer(),
+        recording_evidence_worker_factory=lambda **_: FakeWorker(),
+        review_worker_factory=create_review_worker,
+        client_factory=lambda **_: FakeClient(),
+    )
+    try:
+        runtime.start()
+        assert (
+            observed["runner"](
+                ReviewContext(event_id="evt-budget", source="camera", timestamp_ms=1, frame_id=1)
+            )
+            == "answer"
+        )
+    finally:
+        runtime.stop(join_timeout_seconds=1)
 
 
 def test_review_view_image_rejects_same_name_non_builtin(monkeypatch) -> None:
