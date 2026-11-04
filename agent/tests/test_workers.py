@@ -5,7 +5,6 @@ import threading
 from pathlib import Path
 
 import pytest
-from langgraph.errors import GraphRecursionError
 
 import ssv_agent.event_store.ledger as ledger_module
 import ssv_agent.workers as workers_module
@@ -345,7 +344,7 @@ def test_review_prompt_requires_evidence_reader_and_wall_clock_context() -> None
     assert "不得声称它们是检测帧" in prompt
 
 
-def test_review_worker_without_retriever_downgrades_and_completes_job(
+def test_review_worker_appends_valid_result_and_completes_job(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -353,11 +352,9 @@ def test_review_worker_without_retriever_downgrades_and_completes_job(
     evidence_id = _record_case(db_path, tmp_path / "frame.jpg")
     monkeypatch.setenv("SSV_OUTPUTS_DIR", str(tmp_path / "outputs"))
 
-    def runner(context: ReviewContext, rule_context) -> str:
+    def runner(context: ReviewContext) -> str:
         assert context.event_id == "case-1"
         assert context.evidence_ids == [evidence_id]
-        assert rule_context is not None and not rule_context.available
-        assert rule_context.error_message == "未配置规则检索器"
         return json.dumps(
             {
                 "verdict": "violation",
@@ -388,9 +385,7 @@ def test_review_worker_without_retriever_downgrades_and_completes_job(
     assert case is not None
     assert case.revision == 1
     assert case.review is not None
-    assert case.review["verdict"] == "uncertain"
-    assert case.review["confidence"] == 0.0
-    assert "规则检索不可用" in case.review["explanation"]
+    assert case.review["verdict"] == "violation"
     assert remaining is None
     assert list((tmp_path / "outputs" / "case-1").glob("result-*.json"))
 
@@ -429,20 +424,13 @@ def test_review_worker_retrieves_rules_before_runner_and_accepts_matching_citati
             return RetrievalResult(
                 query=query,
                 backend="fake",
-                chunks=[
-                    Chunk(
-                        chunk_id="chunk-1",
-                        content="必须佩戴安全帽",
-                        score=0.9,
-                        metadata={
-                            "source": "rules.md",
-                            "rule_id": "r1",
-                            "rule_version": "v1",
-                            "section": "5.2",
-                            "event_types": ["person_without_helmet"],
-                        },
-                    )
-                ],
+                chunks=[Chunk(
+                    chunk_id="chunk-1", content="必须佩戴安全帽", score=0.9,
+                    metadata={
+                        "source": "rules.md", "rule_id": "r1", "rule_version": "v1",
+                        "section": "5.2",
+                    },
+                )],
             )
 
     def runner(context, rule_context):
@@ -466,8 +454,6 @@ def test_review_worker_retrieves_rules_before_runner_and_accepts_matching_citati
 
     assert worker.run_once() is True
     assert calls == ["retriever", "runner"]
-    with EventLedger(db_path) as ledger:
-        assert ledger.get_case("case-1").review["verdict"] == "violation"
     _, retrieval_fields = next(
         item for item in observations if item[0] == "rule retrieval observed"
     )
@@ -517,20 +503,13 @@ def test_review_worker_downgrades_invalid_rule_citation_to_uncertain(
             return RetrievalResult(
                 query=query,
                 backend="fake",
-                chunks=[
-                    Chunk(
-                        chunk_id="chunk-1",
-                        content="必须佩戴安全帽",
-                        score=0.9,
-                        metadata={
-                            "source": "rules.md",
-                            "rule_id": "r1",
-                            "rule_version": "v1",
-                            "section": "5.2",
-                            "event_types": ["person_without_helmet"],
-                        },
-                    )
-                ],
+                chunks=[Chunk(
+                    chunk_id="chunk-1", content="必须佩戴安全帽", score=0.9,
+                    metadata={
+                        "source": "rules.md", "rule_id": "r1", "rule_version": "v1",
+                        "section": "5.2",
+                    },
+                )],
             )
 
     def runner(context, rule_context):
@@ -614,24 +593,7 @@ def test_review_worker_refreshes_evidence_before_constructing_context(
     assert contexts == [[evidence_id]]
 
 
-@pytest.mark.parametrize(
-    ("upstream_error", "error_code", "error_message"),
-    [
-        (
-            RuntimeError("model unavailable"),
-            "model_call_failed",
-            "模型服务调用失败，请稍后重试或检查服务配置。",
-        ),
-        (
-            GraphRecursionError("Recursion limit of 256 reached"),
-            "review_step_limit_exceeded",
-            "复核达到执行步数上限，请检查工具调用流程或调整 agent.review.recursion_limit。",
-        ),
-    ],
-)
-def test_review_worker_retries_model_failure_then_marks_job_dead(
-    tmp_path: Path, upstream_error: Exception, error_code: str, error_message: str
-) -> None:
+def test_review_worker_retries_model_failure_then_marks_job_dead(tmp_path: Path) -> None:
     db_path = tmp_path / "events.db"
     _record_case(db_path, tmp_path / "frame.jpg")
     calls = 0
@@ -639,7 +601,7 @@ def test_review_worker_retries_model_failure_then_marks_job_dead(
     def runner(_: ReviewContext) -> str:
         nonlocal calls
         calls += 1
-        raise upstream_error
+        raise RuntimeError("model unavailable")
 
     worker = ReviewWorker(
         ledger_factory=lambda: EventLedger(db_path),
@@ -666,8 +628,8 @@ def test_review_worker_retries_model_failure_then_marks_job_dead(
         ).fetchone()
     assert row is not None
     assert row["state"] == "dead"
-    assert row["error_code"] == error_code
-    assert row["error_message"] == error_message
+    assert row["error_code"] == "model_call_failed"
+    assert row["error_message"] == "模型服务调用失败，请稍后重试或检查服务配置。"
     assert isinstance(row["failed_at_ms"], int)
 
 

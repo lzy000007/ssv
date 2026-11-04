@@ -414,7 +414,7 @@ uv run --extra bge-m3 python -m ssv_agent.knowledge_ingest --config ../config/ss
 索引会显式报告为不可用，不会返回随机条款。`min_score` 用于过滤低相似度结果，没有达到
 阈值时返回“无知识依据”。
 
-复核结果 JSON 使用基础 `rule_citations`：`chunk_id`、`source`、`rule_id`、`rule_version` 和 `section` 必须与本次预检索实际返回的片段一致。确定性结论缺少可用规则或引用身份不符时降为 `uncertain`；事件声明 `event_type` 时，被引用规则的 `event_types` 必须包含该类型。不确定结果中的无法核对引用会被删除。未配置检索器时同样按规则不可用处理，不通过全目录候选兜底。
+复核结果 JSON 使用基础 `rule_citations`：`chunk_id`、`source`、`rule_id`、`rule_version` 和 `section` 必须与本次预检索实际返回的片段一致。配置检索器时，确定性结论缺少可用规则或引用身份不符会降为 `uncertain`；不确定结果中的无法核对引用会被删除。2026-11-04 合并后按用户要求采用远端 worker：未配置检索器时 `rule_context=None`，跳过程序规则引用校验；worker 不向校验器传入事件上下文，因此该调用不核对规则 `event_types`。部署通过 `AgentService` 装配检索器，不通过全目录候选兜底。
 
 ### RAG 修复与规则内容
 
@@ -428,7 +428,7 @@ Qdrant 是显式维护的规则投影：规则正文或元数据修改后必须�
 
 保留 `site-helmet/v1/rule.md`，当前已绑定该身份的视频源无需更换规则 ID。现场佩戴要求、`helmet_required_area=confirmed` 的适用事实、违规/合规与不可观察条件保留在正文。`gb26860-helmet/v1` 的项目示例性质和 `v2` 的标准摘录边界也保留在正文；这些内容不是新的程序判定接口。
 
-复核 worker 将本事件可用证据 ID 集合传给结果解析器。顶层 `evidence_ids` 可从模型已输出的 claims 引用补齐并去重，未知或其他事件的证据 ID 仍拒绝；不会生成新观察或补造事实。没有传入可用集合的独立解析调用保持原有严格汇总契约，历史 Markdown 同样检查证据归属。
+复核 worker 按远端方式调用 `parse_review_result(text)`，模型须在顶层 `evidence_ids` 显式列出 claims 引用的证据；漏列会触发格式校验失败并按既有任务重试处理。解析器仍保留可选的 `available_evidence_ids` 参数，用于传入当前可用集合时校验归属、补齐汇总并去重，但当前 worker 不传入该参数。历史 Markdown 报告仍检查证据归属。
 
 收敛范围、实施计划、历史方案替代关系及真实视频验收统一记录在 [RAG 修改与验收记录](2026-11-03-RAG修改与验收记录.md)。历史方案在该文档中单独归档，不代表当前实现。
 

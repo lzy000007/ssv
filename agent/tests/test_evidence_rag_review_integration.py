@@ -211,7 +211,7 @@ def test_site_markdown_review_completes_and_generates_report_without_policy(
                 "verdict": verdict,
                 "confidence": 0.9,
                 "evidence_status": "available",
-                "evidence_ids": [],
+                "evidence_ids": [evidence_id],
                 "claims": [{"text": "登记画面中的可核查观察", "evidence_ids": [evidence_id]}],
                 "explanation": "按规则正文和实际证据判断，未使用策略或 checks",
                 "rule_citations": [
