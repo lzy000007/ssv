@@ -339,7 +339,7 @@ Agent 的持久化默认位置和配置字段：
 | 无 | `SSV_QDRANT_API_KEY` | Qdrant 服务认证密钥 |
 
 SQLite、结果目录和 Qdrant 的相对路径都相对于 Agent 项目目录解析，也可在 YAML 中使用绝对路径。
-项目根目录执行 `uv run ./ssv redis start` 会同时启动 Redis 和 Qdrant；Qdrant 数据保存在
+项目根目录执行 `uv run ./ssv infra start` 会同时启动 Redis 和 Qdrant；Qdrant 数据保存在
 Docker named volume `qdrant-data`，停止或重建容器不会删除该卷。
 
 Qdrant 只保存可重建的语义索引。embedding backend、model 或 schema 变化会产生新的物理 collection 身份；切换模型后需要重新入队 index job，不要把不同模型的向量混写。
@@ -432,21 +432,30 @@ Qdrant 是显式维护的规则投影：规则正文或元数据修改后必须�
 
 收敛范围、实施计划、历史方案替代关系及真实视频验收统一记录在 [RAG 修改与验收记录](2026-11-03-RAG修改与验收记录.md)。历史方案在该文档中单独归档，不代表当前实现。
 
-## 运行时缓存与 Redis 运维
+## Agent 运行态运维
 
 ```bash
-uv run ./ssv redis start
-uv run ./ssv cache status
-uv run ./ssv cache clear --dry-run
-uv run ./ssv cache clear
+uv run ./ssv infra start
+uv run ./ssv infra status
+uv run ./ssv runtime status
+uv run ./ssv runtime reset --dry-run
+uv run ./ssv runtime reset --yes
 docker exec ssv-redis redis-cli XLEN ssv:events
 docker exec ssv-redis redis-cli XRANGE ssv:events - + COUNT 5
 uv run ./ssv agent
 ```
 
-如果 YAML 修改了 `redis.stream_key`，把 Redis CLI 示例中的 `ssv:events` 换成相同 key。`cache status` 显示该 Stream 的 entries、consumer group pending、Agent 去重 key 数量，以及 SQLite EventLedger 的事件和 durable job 数量；`cache clear` 默认同时清空该 Stream、`ssv:agent:dedup:*` 和 `agent.event_db_path` 对应的 EventLedger 运行时表，`--dry-run` 只统计、不修改。清理前应停止 `./ssv run` 和 `./ssv agent`，否则新事件可能立即重新写入。清理不会影响 `agent/outputs`、Qdrant、DeerFlow checkpointer、其他 Redis key 或 Docker 容器。
+如果 YAML 修改了 `redis.stream_key`，把 Redis CLI 示例中的 `ssv:events` 换成相同 key。`runtime status` 显示该 Stream 的 entries、consumer group pending、Agent 去重 key 数量，以及 SQLite EventLedger 的事件和 durable job 数量。`runtime reset --dry-run` 只统计、不修改；实际重置必须显式使用 `--yes`，同时清空该 Stream、`ssv:agent:dedup:*` 和 `agent.event_db_path` 对应的 EventLedger 运行态表。重置前应停止 `./ssv run` 和 `./ssv agent`，否则新事件可能立即重新写入。重置不会影响 `agent/outputs`、Qdrant、DeerFlow checkpointer、其他 Redis key 或 Docker 容器。
 
-Redis 与 SQLite 分别执行，跨存储清理不是原子操作。若某一边失败，命令仍会尝试另一边并返回非零状态；根据输出停止服务后重试 `./ssv cache clear`。
+Redis 与 SQLite 分别执行，跨存储重置不是原子操作。若某一边失败，命令仍会尝试另一边并返回非零状态；根据输出停止服务后重试 `./ssv runtime reset --yes`。
+
+`runtime status` 还会按 `durable_jobs` 的 `kind/state` 输出任务数量、最大尝试次数、最早更新时间和过期 processing 租约。过期租约表示账本中的 lease 已超过当前时间，不等于可以直接证明 worker 线程已经退出；应结合 Agent 结构化日志中的 `job_id`、`event_id` 和 `worker_id` 判断。
+
+状态输出另外包含最近 5 条死信摘要，仅显示 job ID、类型、revision、尝试次数、更新时间和白名单错误码，不输出事件关联 ID或异常文本。旧记录中的自由文本统一显示为 `legacy_unclassified`。worker 新记录仅使用 `review_failed`、`index_failed`、`evidence_extraction_failed`、`lease_heartbeat_failed` 和 `max_retries_exceeded`；worker 错误日志额外记录异常类型，不输出异常原文。该查询使用只读 SQLite 连接。
+
+Agent consumer 与 worker 线程异常或非预期退出时会记录线程名和安全错误类别，停止其他后台工作，并由 `wait()` 抛出不含异常原文的错误；收到正常停止信号后的退出不记为失败，也不会自动重启。Ingress 处理失败日志不记录原始 payload 或异常文本，保留关联 ID、payload 长度和异常类型；Redis 消费组初始化只忽略 `BUSYGROUP`，其他创建失败会让 Agent 退出并由 `wait()` 报告。
+
+Review worker 每次调用规则检索都会记录 `rule retrieval observed` 结构化日志。日志包含事件、任务和 revision 关联键、backend、成功/可用状态、命中数量、命中片段元数据、检索耗时、查询 SHA-256 和失败码；不记录原始查询文本、规则正文或宿主机证据路径。`rule_index_missing`、`rule_index_empty` 和 `retrieval_failed` 可用于区分索引未建立、索引为空和运行时检索失败。
 
 当 index job 因 embedding/Qdrant 故障进入 `dead` 或需要重建投影时，可在 `agent/` 下重新入队当前账本中的 index jobs：
 

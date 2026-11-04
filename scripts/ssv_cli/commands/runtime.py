@@ -1,4 +1,4 @@
-"""SSV runtime-cache status and cleanup commands."""
+"""SSV runtime state inspection and reset commands."""
 
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ def _print_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> No
 def status(context: ProjectContext, args: Namespace) -> int:
     runtime_config = _runtime_config(context, args)
     settings = runtime_config.redis
-    header("SSV 运行时缓存状态")
+    header("SSV 运行态")
     redis_state = None
     event_db_state = None
     errors: list[str] = []
@@ -108,6 +108,31 @@ def status(context: ProjectContext, args: Namespace) -> int:
                 ("SQLite", "审核结果", event_db_state.review_results),
             )
         )
+        for job_state in event_db_state.durable_job_states:
+            details = (
+                f"数量={job_state.count}; 最大尝试={job_state.max_attempts}; "
+                f"最早更新时间(ms)={job_state.oldest_updated_ms}; "
+                f"过期租约={job_state.expired_leases}"
+            )
+            rows.append(
+                ("SQLite", f"任务 {job_state.kind}/{job_state.state}", details)
+            )
+        expired_lease_count = sum(
+            job_state.expired_leases for job_state in event_db_state.durable_job_states
+        )
+        rows.append(("SQLite", "过期 processing 租约总数", expired_lease_count))
+        if event_db_state.dead_letters:
+            for dead_letter in event_db_state.dead_letters:
+                details = (
+                    f"{dead_letter.kind}; revision={dead_letter.entity_revision}; "
+                    f"尝试={dead_letter.attempts}; 更新时间(ms)={dead_letter.updated_ms}; "
+                    f"错误码={dead_letter.error_code}"
+                )
+                rows.append(
+                    ("SQLite", f"最近死信 #{dead_letter.job_id}", details)
+                )
+        else:
+            rows.append(("SQLite", "最近死信", "无"))
     else:
         rows.append(("SQLite", "状态", "不可用"))
     _print_table(("范围", "指标", "值"), rows)
@@ -117,10 +142,15 @@ def status(context: ProjectContext, args: Namespace) -> int:
     return 0
 
 
-def clear(context: ProjectContext, args: Namespace) -> int:
+def reset(context: ProjectContext, args: Namespace) -> int:
+    if not args.dry_run and not getattr(args, "yes", False):
+        raise CliError(
+            "重置会删除 Redis 运行态和 SQLite EventLedger 数据；"
+            "预览请使用 --dry-run，确认执行请使用 --yes"
+        )
     runtime_config = _runtime_config(context, args)
     settings = runtime_config.redis
-    header("清空 SSV 运行时缓存")
+    header("重置 SSV 运行态")
     redis_result = None
     event_db_result = None
     errors: list[str] = []
@@ -131,14 +161,14 @@ def clear(context: ProjectContext, args: Namespace) -> int:
                 stream_key=settings.stream_key,
                 consumer_group=settings.consumer_group,
             )
-            redis_result = admin.clear_runtime_cache(dry_run=args.dry_run)
+            redis_result = admin.reset_runtime_state(dry_run=args.dry_run)
     except RedisCleanupError as exc:
         redis_result = exc.result
         errors.append(f"Redis: {exc}")
     except RedisError as exc:
         errors.append(f"Redis: {exc}")
     try:
-        event_db_result = EventDbAdmin(runtime_config.event_db_path).clear(dry_run=args.dry_run)
+        event_db_result = EventDbAdmin(runtime_config.event_db_path).reset(dry_run=args.dry_run)
     except EventDbError as exc:
         errors.append(f"SQLite: {exc}")
     mode = "预览" if args.dry_run else ("部分完成" if errors else "完成")
@@ -158,6 +188,6 @@ def clear(context: ProjectContext, args: Namespace) -> int:
             f"event_rows_deleted={event_db_result.deleted_rows}"
         )
     if errors:
-        info("清理失败: " + "; ".join(errors))
+        info("重置失败: " + "; ".join(errors))
         raise CliError("; ".join(errors))
     return 0

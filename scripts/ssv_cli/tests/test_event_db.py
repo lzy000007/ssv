@@ -121,13 +121,123 @@ class EventDbAdminTest(unittest.TestCase):
         self.assertEqual(status.detections, 1)
         self.assertEqual(status.durable_jobs, 1)
         self.assertEqual(status.total_rows, 6)
+        self.assertEqual(status.durable_job_states[0].expired_leases, 0)
+
+    def test_status_breaks_down_durable_jobs_and_expired_leases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.db"
+            _create_event_db(path)
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute("ALTER TABLE durable_jobs ADD COLUMN lease_expires_ms INTEGER")
+                connection.execute(
+                    "INSERT INTO durable_jobs "
+                    "(kind, entity_id, entity_revision, state, attempts, available_at_ms, "
+                    "lease_expires_ms, created_ms, updated_ms) "
+                    "VALUES ('review', 'event-1', 1, 'pending', 0, 1000, NULL, 1000, 1500)"
+                )
+                connection.execute(
+                    "UPDATE durable_jobs SET kind = 'index', state = 'processing', "
+                    "attempts = 3, lease_expires_ms = 1, updated_ms = 2000 "
+                    "WHERE job_id = 1"
+                )
+                connection.execute(
+                    "INSERT INTO durable_jobs "
+                    "(kind, entity_id, entity_revision, state, attempts, available_at_ms, "
+                    "lease_expires_ms, created_ms, updated_ms) "
+                    "VALUES ('index', 'event-1', 1, 'processing', 1, 1000, "
+                    "9223372036854775807, 1000, 2500)"
+                )
+                connection.execute(
+                    "INSERT INTO durable_jobs "
+                    "(kind, entity_id, entity_revision, state, attempts, available_at_ms, "
+                    "lease_expires_ms, created_ms, updated_ms) "
+                    "VALUES ('review', 'event-1', 0, 'dead', 4, 1000, NULL, 1000, 3000)"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            states = {
+                (item.kind, item.state): item
+                for item in EventDbAdmin(path).status().durable_job_states
+            }
+
+        processing = states[("index", "processing")]
+        assert processing.count == 2
+        assert processing.max_attempts == 3
+        assert processing.oldest_updated_ms == 2000
+        assert processing.expired_leases == 1
+        assert states[("review", "pending")].count == 1
+        assert states[("review", "dead")].max_attempts == 4
+
+
+    def test_status_lists_five_recent_dead_letters_with_safe_error_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.db"
+            _create_event_db(path)
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute("ALTER TABLE durable_jobs ADD COLUMN last_error TEXT")
+                for revision in range(1, 8):
+                    error_code = (
+                        "review_failed" if revision == 7 else f"sensitive detail {revision}"
+                    )
+                    connection.execute(
+                        "INSERT INTO durable_jobs "
+                        "(kind, entity_id, entity_revision, state, attempts, available_at_ms, "
+                        "created_ms, updated_ms, last_error) "
+                        "VALUES ('review', ?, ?, 'dead', ?, 1000, 1000, ?, ?)",
+                        (
+                            f"sensitive-event-{revision}",
+                            revision,
+                            revision,
+                            2000 + revision,
+                            error_code,
+                        ),
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+
+            status = EventDbAdmin(path).status()
+
+        self.assertEqual(len(status.dead_letters), 5)
+        self.assertEqual(
+            [item.entity_revision for item in status.dead_letters],
+            [7, 6, 5, 4, 3],
+        )
+        self.assertEqual(status.dead_letters[0].error_code, "review_failed")
+        self.assertTrue(
+            all(item.error_code == "legacy_unclassified" for item in status.dead_letters[1:])
+        )
+        self.assertFalse(hasattr(status.dead_letters[0], "entity_id"))
+        self.assertFalse(hasattr(status.dead_letters[0], "last_error"))
+
+    def test_status_without_last_error_column_uses_legacy_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.db"
+            _create_event_db(path)
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    "UPDATE durable_jobs SET state = 'dead', updated_ms = 2000"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            status = EventDbAdmin(path).status()
+
+        self.assertEqual(len(status.dead_letters), 1)
+        self.assertEqual(status.dead_letters[0].error_code, "legacy_unclassified")
 
     def test_dry_run_does_not_delete_runtime_tables(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.db"
             _create_event_db(path)
 
-            result = EventDbAdmin(path).clear(dry_run=True)
+            result = EventDbAdmin(path).reset(dry_run=True)
             status = EventDbAdmin(path).status()
 
         self.assertTrue(result.dry_run)
@@ -140,7 +250,7 @@ class EventDbAdminTest(unittest.TestCase):
             path = Path(directory) / "events.db"
             _create_event_db(path)
 
-            result = EventDbAdmin(path).clear()
+            result = EventDbAdmin(path).reset()
             status = EventDbAdmin(path).status()
             connection = sqlite3.connect(path)
             try:
@@ -161,7 +271,7 @@ class EventDbAdminTest(unittest.TestCase):
 
             admin = EventDbAdmin(path)
             status = admin.status()
-            result = admin.clear()
+            result = admin.reset()
 
         self.assertFalse(status.exists)
         self.assertEqual(status.total_rows, 0)

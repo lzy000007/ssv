@@ -927,3 +927,160 @@ def test_signal_stop_during_consumer_creation_does_not_deadlock_or_start_ingress
     assert not consumer.started.is_set()
 
     runtime.stop(join_timeout_seconds=1)
+
+
+def test_worker_exception_stops_service_and_is_reported_without_message() -> None:
+    class FakeConsumer:
+        def __init__(self) -> None:
+            self.started = Event()
+            self.stopped = Event()
+
+        def start(self) -> None:
+            self.started.set()
+            self.stopped.wait()
+
+        def stop(self) -> None:
+            self.stopped.set()
+
+    class FailingWorker:
+        def __init__(self, consumer_started: Event) -> None:
+            self.consumer_started = consumer_started
+
+        def run(self, _stopping: Event) -> None:
+            assert self.consumer_started.wait(1)
+            raise ValueError("sensitive worker details")
+
+    consumer = FakeConsumer()
+    worker = FailingWorker(consumer.started)
+    runtime = service.AgentService(
+        SsvConfig(),
+        consumer_factory=lambda _: consumer,
+    )
+    runtime._start_review_worker = lambda: runtime._start_worker_thread(
+        "ssv-agent-review-test", worker.run
+    )
+
+    runtime.start()
+    assert consumer.started.wait(1)
+    with pytest.raises(RuntimeError) as error:
+        runtime.wait()
+    runtime.stop(join_timeout_seconds=1)
+
+    assert "ssv-agent-review-test" in str(error.value)
+    assert "ValueError" in str(error.value)
+    assert "sensitive worker details" not in str(error.value)
+    assert consumer.stopped.is_set()
+
+
+def test_worker_failure_unblocks_wait_when_consumer_stop_does_not_return() -> None:
+    release_consumer = Event()
+    consumer_started = Event()
+
+    class UnresponsiveConsumer:
+        def start(self) -> None:
+            consumer_started.set()
+            release_consumer.wait()
+
+        def stop(self) -> None:
+            return None
+
+    class FailingWorker:
+        def run(self, _stopping: Event) -> None:
+            assert consumer_started.wait(1)
+            raise RuntimeError("private failure detail")
+
+    runtime = service.AgentService(
+        SsvConfig(),
+        consumer_factory=lambda _: UnresponsiveConsumer(),
+    )
+    runtime._start_review_worker = lambda: runtime._start_worker_thread(
+        "ssv-agent-review-test", FailingWorker().run
+    )
+
+    runtime.start()
+    with pytest.raises(RuntimeError, match="background thread") as error:
+        runtime.wait()
+    release_consumer.set()
+    runtime.stop(join_timeout_seconds=1)
+
+    assert "private failure detail" not in str(error.value)
+
+
+def test_worker_return_without_stop_request_is_reported_as_unexpected() -> None:
+    class FakeConsumer:
+        def __init__(self) -> None:
+            self.started = Event()
+            self.stopped = Event()
+
+        def start(self) -> None:
+            self.started.set()
+            self.stopped.wait()
+
+        def stop(self) -> None:
+            self.stopped.set()
+
+    class ReturningWorker:
+        def __init__(self, consumer_started: Event) -> None:
+            self.consumer_started = consumer_started
+
+        def run(self, _stopping: Event) -> None:
+            assert self.consumer_started.wait(1)
+
+    consumer = FakeConsumer()
+    worker = ReturningWorker(consumer.started)
+    runtime = service.AgentService(
+        SsvConfig(),
+        consumer_factory=lambda _: consumer,
+    )
+    runtime._start_review_worker = lambda: runtime._start_worker_thread(
+        "ssv-agent-review-test", worker.run
+    )
+
+    runtime.start()
+    assert consumer.started.wait(1)
+    with pytest.raises(RuntimeError, match="exited unexpectedly") as error:
+        runtime.wait()
+    runtime.stop(join_timeout_seconds=1)
+
+    assert "ssv-agent-review-test" in str(error.value)
+    assert consumer.stopped.is_set()
+
+
+def test_consumer_exception_stops_workers_and_is_reported_without_message() -> None:
+    class FailingConsumer:
+        def __init__(self) -> None:
+            self.stopped = Event()
+
+        def start(self) -> None:
+            raise OSError("sensitive Redis credentials")
+
+        def stop(self) -> None:
+            self.stopped.set()
+
+    class FakeWorker:
+        def __init__(self) -> None:
+            self.started = Event()
+
+        def run(self, stopping: Event) -> None:
+            self.started.set()
+            stopping.wait()
+
+    consumer = FailingConsumer()
+    worker = FakeWorker()
+    runtime = service.AgentService(
+        SsvConfig.model_validate({"agent": {"review": {"enabled": True}}}),
+        consumer_factory=lambda _: consumer,
+        review_worker_factory=lambda **_: worker,
+        client_factory=lambda **_: object(),
+    )
+
+    runtime.start()
+    assert worker.started.wait(1)
+    with pytest.raises(RuntimeError) as error:
+        runtime.wait()
+    runtime.stop(join_timeout_seconds=1)
+
+    assert "ssv-agent-consumer" in str(error.value)
+    assert "OSError" in str(error.value)
+    assert "sensitive Redis credentials" not in str(error.value)
+    assert consumer.stopped.is_set()

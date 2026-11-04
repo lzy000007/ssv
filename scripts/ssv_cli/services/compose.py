@@ -89,7 +89,7 @@ def _qdrant_ready(port: int) -> bool:
         return False
 
 
-def start_redis(
+def start_infrastructure(
     context: ProjectContext,
     settings: RedisSettings,
     *,
@@ -124,10 +124,17 @@ def start_redis(
     raise CliError("Qdrant 启动超时")
 
 
-def stop_redis(context: ProjectContext) -> int:
+def stop_infrastructure(context: ProjectContext) -> int:
     if not _is_running(context):
-        info("Redis 未在运行")
+        info("Redis/Qdrant 基础设施未在运行")
         return 0
     _compose(context, "down")
-    info("Redis 已停止")
+    info("Redis/Qdrant 基础设施已停止")
+    return 0
+
+
+def status_infrastructure(context: ProjectContext) -> int:
+    result = _compose(context, "ps", capture_output=True)
+    output = result.stdout.strip()
+    info(output or "Redis/Qdrant 基础设施未在运行")
     return 0

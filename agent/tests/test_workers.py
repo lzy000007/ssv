@@ -410,10 +410,21 @@ def test_review_worker_retrieves_rules_before_runner_and_accepts_matching_citati
     monkeypatch.setenv("SSV_OUTPUTS_DIR", str(tmp_path / "outputs"))
     calls: list[str] = []
     observed_filters: dict[str, str] = {}
+    queries: list[str] = []
+    observations: list[tuple[str, dict[str, object]]] = []
+
+    class FakeLogger:
+        def info(self, event: str, **fields: object) -> None:
+            observations.append((event, fields))
+
+    monkeypatch.setattr(workers_module, "logger", FakeLogger())
 
     class Retriever:
+        backend_name = "fake"
+
         async def retrieve(self, query, *, top_k=5, filters=None):
             calls.append("retriever")
+            queries.append(query)
             observed_filters.update(filters or {})
             return RetrievalResult(
                 query=query,
@@ -457,6 +468,29 @@ def test_review_worker_retrieves_rules_before_runner_and_accepts_matching_citati
     assert calls == ["retriever", "runner"]
     with EventLedger(db_path) as ledger:
         assert ledger.get_case("case-1").review["verdict"] == "violation"
+    _, retrieval_fields = next(
+        item for item in observations if item[0] == "rule retrieval observed"
+    )
+    assert retrieval_fields["event_id"] == "case-1"
+    assert retrieval_fields["job_id"] > 0
+    assert retrieval_fields["entity_revision"] == 0
+    assert retrieval_fields["backend"] == "fake"
+    assert retrieval_fields["success"] is True
+    assert retrieval_fields["available"] is True
+    assert retrieval_fields["chunk_count"] == 1
+    assert retrieval_fields["chunks"] == [{
+        "chunk_id": "chunk-1",
+        "score": 0.9,
+        "source": "rules.md",
+        "rule_id": "r1",
+        "rule_version": "v1",
+        "section": "5.2",
+    }]
+    assert len(retrieval_fields["query_sha256"]) == 64
+    assert retrieval_fields["query_length"] == len(queries[0])
+    assert queries[0] not in repr(retrieval_fields)
+    assert "必须佩戴安全帽" not in repr(retrieval_fields)
+    assert retrieval_fields["retrieval_ms"] >= 0
     assert observed_filters == {
         "event_type": "person_without_helmet",
         "rule_id": "r1",
@@ -1263,7 +1297,7 @@ def test_review_worker_run_recovers_after_transient_ledger_factory_failure(monke
             {
                 "worker_id": "review-loop",
                 "job_kind": "review",
-                "error": "ledger factory unavailable",
+                "error": "OSError",
             },
         )
     ]
@@ -1327,7 +1361,7 @@ def test_index_worker_run_recovers_after_transient_ledger_context_failure(monkey
             {
                 "worker_id": "index-loop",
                 "job_kind": "index",
-                "error": "ledger context unavailable",
+                "error": "OSError",
             },
         )
     ]
@@ -1509,3 +1543,77 @@ def test_report_worker_does_not_complete_after_lease_is_reclaimed(
     assert row["state"] == JobState.PROCESSING.value
     assert row["lease_owner"] == "report-b"
     assert row["attempts"] == 2
+
+
+@pytest.mark.parametrize("retrieval_mode", ["empty", "exception"])
+def test_review_worker_logs_empty_and_failed_rule_retrieval(
+    tmp_path: Path,
+    monkeypatch,
+    retrieval_mode: str,
+) -> None:
+    db_path = tmp_path / "events.db"
+    evidence_id = _record_case(
+        db_path,
+        tmp_path / "frame.jpg",
+        event_type="person_without_helmet",
+        rule_id="r1",
+        rule_version="v1",
+    )
+    monkeypatch.setenv("SSV_OUTPUTS_DIR", str(tmp_path / "outputs"))
+    observations: list[tuple[str, dict[str, object]]] = []
+    queries: list[str] = []
+
+    class FakeLogger:
+        def info(self, event: str, **fields: object) -> None:
+            observations.append((event, fields))
+
+    monkeypatch.setattr(workers_module, "logger", FakeLogger())
+
+    class Retriever:
+        backend_name = "test-qdrant"
+
+        async def retrieve(self, query, *, top_k=5, filters=None):
+            queries.append(query)
+            if retrieval_mode == "exception":
+                raise ConnectionError("private endpoint details")
+            return RetrievalResult(query=query, backend=self.backend_name, chunks=[])
+
+    def runner(context, rule_context):
+        assert rule_context is not None and not rule_context.available
+        return json.dumps({
+            "verdict": "uncertain",
+            "confidence": 0.4,
+            "evidence_status": "available",
+            "evidence_ids": [evidence_id],
+            "claims": [],
+            "explanation": "规则未能提供可用候选。",
+            "rule_citations": [],
+        })
+
+    worker = ReviewWorker(
+        ledger_factory=lambda: EventLedger(db_path),
+        runner=runner,
+        rule_retriever=Retriever(),
+        worker_id="review-observation-test",
+        lease_ms=1_000,
+        max_retries=2,
+        retry_delay_ms=0,
+    )
+
+    assert worker.run_once() is True
+    _, fields = next(item for item in observations if item[0] == "rule retrieval observed")
+    assert fields["event_id"] == "case-1"
+    assert fields["job_id"] > 0
+    assert fields["entity_revision"] == 0
+    assert fields["backend"] == "test-qdrant"
+    assert fields["chunk_count"] == 0
+    assert fields["available"] is False
+    assert fields["success"] is (retrieval_mode == "empty")
+    assert fields["error_type"] == (
+        "ConnectionError" if retrieval_mode == "exception" else None
+    )
+    assert fields["failure_code"] == (
+        "retrieval_failed" if retrieval_mode == "exception" else None
+    )
+    assert queries[0] not in repr(fields)
+    assert "private endpoint details" not in repr(fields)

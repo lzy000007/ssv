@@ -11,6 +11,7 @@ from threading import Event
 
 import structlog
 from redis import Redis
+from redis.exceptions import ResponseError
 
 from ssv_agent.config import SsvConfig
 from ssv_agent.dedup import DedupDecision, EventDeduper
@@ -74,9 +75,14 @@ class EventConsumer:
         try:
             self._redis.xgroup_create(self._stream, self._group, id="0", mkstream=True)
             logger.info("created consumer group", group=self._group, stream=self._stream)
-        except Exception:
-            # Group already exists — that's fine.
-            pass
+        except ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+            logger.info(
+                "consumer group already exists",
+                group=self._group,
+                stream=self._stream,
+            )
 
     def start(self) -> None:
         """Blocking consumer loop.  Returns on SIGINT/SIGTERM."""
@@ -98,7 +104,10 @@ class EventConsumer:
             try:
                 reclaimed = self._reclaim_pending()
             except Exception as exc:
-                logger.warning("redis pending reclaim error", error=str(exc))
+                logger.warning(
+                    "redis pending reclaim error",
+                    error_type=type(exc).__name__,
+                )
             else:
                 self._handle_messages(reclaimed)
             self._flush_episode_timeouts()
@@ -114,7 +123,7 @@ class EventConsumer:
                     block=1000,  # 1 s
                 )
             except Exception as exc:
-                logger.warning("redis read error", error=str(exc))
+                logger.warning("redis read error", error_type=type(exc).__name__)
                 time.sleep(2)
                 continue
 
@@ -202,19 +211,29 @@ class EventConsumer:
     def handle_event(self, msg_id: str, fields: dict[str, str]) -> None:
         """处理一条 ingress：poison/dedup ACK，账本失败则保留 pending。"""
         raw = fields.get("event")
+        payload_length = len(raw) if isinstance(raw, (str, bytes)) else 0
         try:
             event = json.loads(raw)
             if not isinstance(event, dict):
                 raise ValueError("event payload must be a JSON object")
         except (TypeError, ValueError, json.JSONDecodeError):
-            logger.warning("malformed event, acking", msg_id=msg_id, raw=raw)
+            logger.warning(
+                "malformed event, acking",
+                msg_id=msg_id,
+                payload_length=payload_length,
+            )
             self._redis.xack(self._stream, self._group, msg_id)
             return
 
         try:
             context = ReviewContext.from_event(msg_id, event)
         except Exception as exc:
-            logger.warning("invalid event, acking", msg_id=msg_id, error=str(exc))
+            logger.warning(
+                "invalid event, acking",
+                msg_id=msg_id,
+                payload_length=payload_length,
+                error_type=type(exc).__name__,
+            )
             self._redis.xack(self._stream, self._group, msg_id)
             return
 
@@ -249,7 +268,9 @@ class EventConsumer:
             logger.error(
                 "event ledger record failed; leaving Redis entry pending",
                 event_id=context.event_id,
-                error=str(exc),
+                ingress_id=msg_id,
+                payload_length=payload_length,
+                error_type=type(exc).__name__,
             )
             return
         logger.info(
@@ -267,7 +288,10 @@ class EventConsumer:
             with self._ledger_factory() as ledger:
                 closed = self._episode_aggregator.flush(ledger)
         except Exception as exc:
-            logger.warning("episode timeout flush failed", error=str(exc))
+            logger.warning(
+                "episode timeout flush failed",
+                error_type=type(exc).__name__,
+            )
             return
         for episode in closed:
             logger.info(

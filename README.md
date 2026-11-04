@@ -84,7 +84,7 @@ cp config/ssv.example.yaml config/ssv.yaml
 ### 4. 启动 Redis、Qdrant 并运行
 
 ```bash
-./ssv redis start
+./ssv infra start
 ./ssv run --headless
 ```
 
@@ -109,8 +109,8 @@ Agent 是独立进程，需要时另开终端执行：
 | `./ssv run [RUNNER_ARGS]` | 启动 C++ 实时链路 |
 | `./ssv inspect` | 检查构建验证插件 `ssvtemplate` 是否注册 |
 | `./ssv test` | 编排 Python、C++、Agent 和契约测试 |
-| `./ssv redis start\|stop` | 启动和停止本地 Docker Redis、Qdrant |
-| `./ssv cache status\|clear` | 查看和清空 SSV 运行时缓存 |
+| `./ssv infra start\|stop\|status` | 管理本地 Docker Redis、Qdrant 基础设施 |
+| `./ssv runtime status\|reset` | 查看和重置 Redis 运行态与 SQLite EventLedger |
 | `./ssv agent [--config PATH]` | 启动 Python Agent |
 | `./ssv model export` | 导出示例 YOLOv8n 原始 ONNX |
 | `./ssv model manifest ...` | 从原始 ONNX 和 TensorRT engine 生成 schema v2 manifest |
@@ -118,7 +118,7 @@ Agent 是独立进程，需要时另开终端执行：
 
 `run` 的 `--display`、`--headless`、`--overlay` 和 `--display-backend` 参数只覆盖本次进程的输出设置，不会改写 YAML。实时配置、RTSP 拉流/分析/推流和外部 RTSP server 边界见 [运行与配置](docs/运行与配置.md)；字段级说明见 [检测前端配置](docs/检测前端配置.md)。
 
-`./ssv cache status|clear` 用于查看或清理当前运行配置的 Redis Stream、Agent 去重和 EventLedger 运行时表；详细边界见 [Agent 配置](docs/Agent配置.md)。清理前应停止 `./ssv run` 和 `./ssv agent`。
+`./ssv runtime status|reset` 用于查看或重置当前运行配置的 Redis Stream、Agent 去重和 EventLedger 运行态；重置前应停止 `./ssv run` 和 `./ssv agent`。实际重置必须显式使用 `--yes`，可先用 `--dry-run` 预览。详细边界见 [Agent 配置](docs/Agent配置.md)。
 
 ## 配置文件
 

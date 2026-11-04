@@ -11,13 +11,19 @@ from unittest.mock import MagicMock, patch
 
 from scripts.ssv_cli.cli import build_parser, main
 from scripts.ssv_cli.commands import build as build_command
-from scripts.ssv_cli.commands import cache as cache_command
+from scripts.ssv_cli.commands import runtime as cache_command
 from scripts.ssv_cli.commands import test as test_command
 from scripts.ssv_cli.commands.clean import run as clean_command
 from scripts.ssv_cli.config import RedisSettings, RuntimeConfig, load_runtime_config
 from scripts.ssv_cli.context import ProjectContext, load_dotenv
 from scripts.ssv_cli.output import CliError
-from scripts.ssv_cli.services.event_db import EventDbCleanupResult, EventDbError, EventDbStatus
+from scripts.ssv_cli.services.event_db import (
+    DeadLetterStatus,
+    DurableJobStatus,
+    EventDbCleanupResult,
+    EventDbError,
+    EventDbStatus,
+)
 from scripts.ssv_cli.services.redis_admin import (
     RedisCleanupError,
     RedisCleanupResult,
@@ -115,47 +121,54 @@ class CliParserTest(unittest.TestCase):
             build_parser().parse_args(["model", "prepare"])
         self.assertEqual(raised.exception.code, 2)
 
-    def test_redis_stop_is_an_explicit_action(self) -> None:
-        args = build_parser().parse_args(["redis", "stop"])
-        self.assertEqual(args.command, "redis")
-        self.assertEqual(args.redis_action, "stop")
+    def test_infra_stop_is_an_explicit_action(self) -> None:
+        args = build_parser().parse_args(["infra", "stop"])
+        self.assertEqual(args.command, "infra")
+        self.assertEqual(args.infra_action, "stop")
 
-    def test_redis_requires_an_explicit_action(self) -> None:
+    def test_infra_status_is_an_explicit_action(self) -> None:
+        args = build_parser().parse_args(["infra", "status"])
+        self.assertEqual(args.command, "infra")
+        self.assertEqual(args.infra_action, "status")
+
+    def test_infra_requires_an_explicit_action(self) -> None:
         with self.assertRaises(SystemExit) as raised:
-            build_parser().parse_args(["redis"])
+            build_parser().parse_args(["infra"])
         self.assertEqual(raised.exception.code, 2)
 
-    def test_cache_status_is_an_explicit_action(self) -> None:
-        args = build_parser().parse_args(["cache", "status"])
-        self.assertEqual(args.command, "cache")
-        self.assertEqual(args.cache_action, "status")
+    def test_runtime_status_is_an_explicit_action(self) -> None:
+        args = build_parser().parse_args(["runtime", "status"])
+        self.assertEqual(args.command, "runtime")
+        self.assertEqual(args.runtime_action, "status")
 
-    def test_cache_requires_an_explicit_action(self) -> None:
+    def test_runtime_requires_an_explicit_action(self) -> None:
         with self.assertRaises(SystemExit) as raised:
-            build_parser().parse_args(["cache"])
+            build_parser().parse_args(["runtime"])
         self.assertEqual(raised.exception.code, 2)
 
-    def test_cache_clear_targets_runtime_cache_without_confirmation_flags(self) -> None:
-        args = build_parser().parse_args(["cache", "clear"])
+    def test_runtime_reset_requires_explicit_confirmation_to_apply(self) -> None:
+        args = build_parser().parse_args(["runtime", "reset"])
         self.assertFalse(args.dry_run)
-        self.assertFalse(hasattr(args, "include_stream"))
-        self.assertFalse(hasattr(args, "yes"))
+        self.assertFalse(args.yes)
 
-    def test_cache_clear_supports_dry_run(self) -> None:
-        args = build_parser().parse_args(["cache", "clear", "--dry-run"])
+    def test_runtime_reset_supports_dry_run_and_confirmation(self) -> None:
+        args = build_parser().parse_args(["runtime", "reset", "--dry-run"])
         self.assertTrue(args.dry_run)
+        self.assertFalse(args.yes)
+        args = build_parser().parse_args(["runtime", "reset", "--yes"])
+        self.assertTrue(args.yes)
+        self.assertFalse(args.dry_run)
 
-    def test_redis_runtime_actions_are_rejected(self) -> None:
-        for action in ("status", "clear", "clean"):
-            with self.subTest(action=action), self.assertRaises(SystemExit) as raised:
-                build_parser().parse_args(["redis", action])
+    def test_old_redis_and_cache_commands_are_rejected(self) -> None:
+        for old_command in (("redis", "start"), ("cache", "status")):
+            with self.subTest(command=old_command), self.assertRaises(SystemExit) as raised:
+                build_parser().parse_args(list(old_command))
             self.assertEqual(raised.exception.code, 2)
 
-    def test_cache_clear_rejects_legacy_flags(self) -> None:
-        for flag in ("--stream", "--yes"):
-            with self.subTest(flag=flag), self.assertRaises(SystemExit) as raised:
-                build_parser().parse_args(["cache", "clear", flag])
-            self.assertEqual(raised.exception.code, 2)
+    def test_runtime_reset_rejects_conflicting_confirmation_options(self) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            build_parser().parse_args(["runtime", "reset", "--dry-run", "--yes"])
+        self.assertEqual(raised.exception.code, 2)
 
 class ContextTest(unittest.TestCase):
     def test_dotenv_does_not_replace_existing_environment(self) -> None:
@@ -279,7 +292,18 @@ class CleanCommandTest(unittest.TestCase):
                 clean_command(self._context(root, root), Namespace())
 
 
-class CacheCommandTest(unittest.TestCase):
+class RuntimeCommandTest(unittest.TestCase):
+    def test_reset_requires_confirmation_before_loading_runtime_config(self) -> None:
+        context = ProjectContext(
+            root=ROOT,
+            environment={},
+            config_path=None,
+            build_dir=ROOT / "build",
+            compose_file=ROOT / "docker" / "compose.yaml",
+        )
+        with self.assertRaisesRegex(CliError, "--yes"):
+            cache_command.reset(context, Namespace(dry_run=False))
+
     def test_clear_reports_partial_statistics_before_returning_error(self) -> None:
         context = ProjectContext(
             root=ROOT,
@@ -296,6 +320,7 @@ class CacheCommandTest(unittest.TestCase):
             stream_key=None,
             group=None,
             dry_run=False,
+            yes=True,
         )
         failure = RedisCleanupError(
             "DEL failed",
@@ -322,18 +347,18 @@ class CacheCommandTest(unittest.TestCase):
             ),
             patch.object(cache_command, "RedisConnection", return_value=connection),
             patch.object(
-                cache_command.RedisAdmin, "clear_runtime_cache", side_effect=failure
+                cache_command.RedisAdmin, "reset_runtime_state", side_effect=failure
             ) as clear,
             patch.object(cache_command, "info") as output,
             self.assertRaises(CliError),
         ):
-            cache_command.clear(context, args)
+            cache_command.reset(context, args)
 
         clear.assert_called_once_with(dry_run=False)
         messages = [call.args[0] for call in output.call_args_list]
         self.assertTrue(any("stream_deleted=1" in message for message in messages))
         self.assertTrue(any("dedup_deleted=2" in message for message in messages))
-        self.assertTrue(any("清理失败" in message for message in messages))
+        self.assertTrue(any("重置失败" in message for message in messages))
 
     def test_status_reports_both_backends_independently(self) -> None:
         context = ProjectContext(
@@ -359,6 +384,26 @@ class CacheCommandTest(unittest.TestCase):
             exists=True,
             events=3,
             durable_jobs=4,
+            durable_job_states=(
+                DurableJobStatus(
+                    kind="review",
+                    state="processing",
+                    count=2,
+                    max_attempts=3,
+                    oldest_updated_ms=1000,
+                    expired_leases=1,
+                ),
+            ),
+            dead_letters=(
+                DeadLetterStatus(
+                    job_id=42,
+                    kind="review",
+                    entity_revision=2,
+                    attempts=4,
+                    updated_ms=2000,
+                    error_code="legacy_unclassified",
+                ),
+            ),
         )
 
         with (
@@ -383,6 +428,10 @@ class CacheCommandTest(unittest.TestCase):
         self.assertTrue(any("| 范围" in message for message in messages))
         self.assertTrue(any("| 事件流" in message for message in messages))
         self.assertTrue(any("| 事件" in message for message in messages))
+        self.assertTrue(any("任务 review/processing" in message for message in messages))
+        self.assertTrue(any("过期租约=1" in message for message in messages))
+        self.assertTrue(any("最近死信 #42" in message for message in messages))
+        self.assertTrue(any("legacy_unclassified" in message for message in messages))
         table_lines = [message for message in messages if message.startswith(("+", "|"))]
         self.assertGreater(len(table_lines), 3)
         self.assertEqual(len({cache_command._display_width(line) for line in table_lines}), 1)
@@ -445,6 +494,7 @@ class CacheCommandTest(unittest.TestCase):
             stream_key=None,
             group=None,
             dry_run=False,
+            yes=True,
         )
         event_db_result = EventDbCleanupResult(
             status_before=EventDbStatus(path=ROOT / "agent" / "data" / "events.db", exists=True),
@@ -466,16 +516,16 @@ class CacheCommandTest(unittest.TestCase):
             patch.object(cache_command, "RedisConnection", return_value=connection),
             patch.object(
                 cache_command.RedisAdmin,
-                "clear_runtime_cache",
+                "reset_runtime_state",
                 side_effect=RedisError("offline"),
             ) as clear_redis,
             patch.object(
-                cache_command.EventDbAdmin, "clear", return_value=event_db_result
+                cache_command.EventDbAdmin, "reset", return_value=event_db_result
             ) as clear_db,
             patch.object(cache_command, "info") as output,
             self.assertRaises(CliError),
         ):
-            cache_command.clear(context, args)
+            cache_command.reset(context, args)
 
         clear_redis.assert_called_once_with(dry_run=False)
         clear_db.assert_called_once_with(dry_run=False)
@@ -499,6 +549,7 @@ class CacheCommandTest(unittest.TestCase):
             stream_key=None,
             group=None,
             dry_run=False,
+            yes=True,
         )
         redis_result = RedisCleanupResult(4, 2, 1, 1, 1, False)
         connection = MagicMock()
@@ -516,18 +567,18 @@ class CacheCommandTest(unittest.TestCase):
             patch.object(cache_command, "RedisConnection", return_value=connection),
             patch.object(
                 cache_command.RedisAdmin,
-                "clear_runtime_cache",
+                "reset_runtime_state",
                 return_value=redis_result,
             ) as clear_redis,
             patch.object(
                 cache_command.EventDbAdmin,
-                "clear",
+                "reset",
                 side_effect=EventDbError("database locked"),
             ) as clear_db,
             patch.object(cache_command, "info") as output,
             self.assertRaises(CliError),
         ):
-            cache_command.clear(context, args)
+            cache_command.reset(context, args)
 
         clear_redis.assert_called_once_with(dry_run=False)
         clear_db.assert_called_once_with(dry_run=False)
@@ -551,6 +602,7 @@ class CacheCommandTest(unittest.TestCase):
             stream_key=None,
             group=None,
             dry_run=False,
+            yes=True,
         )
         redis_result = RedisCleanupResult(
             stream_entries_before=4,
@@ -585,16 +637,16 @@ class CacheCommandTest(unittest.TestCase):
             patch.object(cache_command, "RedisConnection", return_value=connection),
             patch.object(
                 cache_command.RedisAdmin,
-                "clear_runtime_cache",
+                "reset_runtime_state",
                 return_value=redis_result,
             ) as clear_redis,
             patch.object(
                 cache_command.EventDbAdmin,
-                "clear",
+                "reset",
                 return_value=event_db_result,
             ) as clear_event_db,
         ):
-            self.assertEqual(cache_command.clear(context, args), 0)
+            self.assertEqual(cache_command.reset(context, args), 0)
 
         clear_redis.assert_called_once_with(dry_run=False)
         clear_event_db.assert_called_once_with(dry_run=False)
@@ -637,16 +689,16 @@ class CacheCommandTest(unittest.TestCase):
             patch.object(cache_command, "RedisConnection", return_value=connection),
             patch.object(
                 cache_command.RedisAdmin,
-                "clear_runtime_cache",
+                "reset_runtime_state",
                 return_value=redis_result,
             ) as clear_redis,
             patch.object(
                 cache_command.EventDbAdmin,
-                "clear",
+                "reset",
                 return_value=event_db_result,
             ) as clear_event_db,
         ):
-            self.assertEqual(cache_command.clear(context, args), 0)
+            self.assertEqual(cache_command.reset(context, args), 0)
 
         clear_redis.assert_called_once_with(dry_run=True)
         clear_event_db.assert_called_once_with(dry_run=True)
@@ -725,7 +777,7 @@ class CliWrapperTest(unittest.TestCase):
                 "SSV_TEST_RECORD": str(record),
             }
             result = subprocess.run(
-                [str(ROOT / "ssv"), "redis", "status", "--db", "4"],
+                [str(ROOT / "ssv"), "infra", "status", "--db", "4"],
                 cwd=work,
                 env=environment,
                 text=True,
@@ -743,7 +795,7 @@ class CliWrapperTest(unittest.TestCase):
                 str(ROOT),
                 "python",
                 str(ROOT / "ssv.py"),
-                "redis",
+                "infra",
                 "status",
                 "--db",
                 "4",

@@ -6,7 +6,7 @@ import argparse
 import sys
 from collections.abc import Sequence
 
-from .commands import agent, build, cache, clean, inspect, model, redis, run, test
+from .commands import agent, build, clean, infra, inspect, model, run, runtime, test
 from .context import ProjectContext
 from .output import CliError, error
 
@@ -33,11 +33,15 @@ class _StoreOnce(argparse.Action):
         setattr(namespace, self.dest, value)
 
 
-def _add_redis_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", default=argparse.SUPPRESS, help="Redis 使用的 YAML 配置路径")
+def _add_connection_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", default=argparse.SUPPRESS, help="SSV 运行配置路径")
     parser.add_argument("--host", default=argparse.SUPPRESS, help="Redis 主机")
     parser.add_argument("--port", type=int, default=argparse.SUPPRESS, help="Redis 端口")
     parser.add_argument("--db", type=int, default=argparse.SUPPRESS, help="Redis database 编号")
+
+
+def _add_runtime_options(parser: argparse.ArgumentParser) -> None:
+    _add_connection_options(parser)
     parser.add_argument(
         "--stream-key",
         dest="stream_key",
@@ -80,28 +84,35 @@ def build_parser() -> argparse.ArgumentParser:
     clean_parser = commands.add_parser("clean", help="删除 Meson 构建目录")
     clean_parser.set_defaults(handler=clean.run)
 
-    redis_parser = commands.add_parser("redis", help="启动和停止 Docker Redis、Qdrant")
-    _add_redis_options(redis_parser)
-    redis_actions = redis_parser.add_subparsers(dest="redis_action", metavar="ACTION")
-    redis_actions.required = True
-    redis_start = redis_actions.add_parser("start", help="启动 Docker Redis、Qdrant")
-    _add_redis_options(redis_start)
-    redis_start.set_defaults(handler=redis.start)
-    redis_stop = redis_actions.add_parser("stop", help="停止 Docker Redis、Qdrant")
-    _add_redis_options(redis_stop)
-    redis_stop.set_defaults(handler=redis.stop)
+    infra_parser = commands.add_parser("infra", help="管理 Docker Redis、Qdrant 基础设施")
+    infra_actions = infra_parser.add_subparsers(dest="infra_action", metavar="ACTION")
+    infra_actions.required = True
+    infra_start = infra_actions.add_parser("start", help="启动 Docker Redis、Qdrant")
+    _add_connection_options(infra_start)
+    infra_start.set_defaults(handler=infra.start)
+    infra_stop = infra_actions.add_parser("stop", help="停止 Docker Redis、Qdrant")
+    infra_stop.set_defaults(handler=infra.stop)
+    infra_status = infra_actions.add_parser("status", help="查看 Docker Redis、Qdrant 状态")
+    infra_status.set_defaults(handler=infra.status)
 
-    cache_parser = commands.add_parser("cache", help="管理 SSV 运行时缓存")
-    _add_redis_options(cache_parser)
-    cache_actions = cache_parser.add_subparsers(dest="cache_action", metavar="ACTION")
-    cache_actions.required = True
-    cache_status = cache_actions.add_parser("status", help="查看 SSV 运行时缓存状态")
-    _add_redis_options(cache_status)
-    cache_status.set_defaults(handler=cache.status)
-    cache_clear = cache_actions.add_parser("clear", help="直接清空 SSV 运行时缓存")
-    _add_redis_options(cache_clear)
-    cache_clear.add_argument("--dry-run", action="store_true", help="只统计，不修改运行时记录")
-    cache_clear.set_defaults(handler=cache.clear)
+    runtime_parser = commands.add_parser("runtime", help="管理 SSV 运行态")
+    runtime_actions = runtime_parser.add_subparsers(dest="runtime_action", metavar="ACTION")
+    runtime_actions.required = True
+    runtime_status = runtime_actions.add_parser("status", help="查看 SSV 运行态")
+    _add_runtime_options(runtime_status)
+    runtime_status.set_defaults(handler=runtime.status)
+    runtime_reset = runtime_actions.add_parser("reset", help="重置 SSV 运行态数据")
+    _add_runtime_options(runtime_reset)
+    reset_confirmation = runtime_reset.add_mutually_exclusive_group()
+    reset_confirmation.add_argument(
+        "--dry-run", action="store_true", help="只统计，不修改运行态数据"
+    )
+    reset_confirmation.add_argument(
+        "--yes",
+        action="store_true",
+        help="确认删除 Redis 运行态记录和 SQLite EventLedger 数据",
+    )
+    runtime_reset.set_defaults(handler=runtime.reset)
 
     test_parser = commands.add_parser("test", help="运行代码测试和链路冒烟测试后退出")
     test_parser.set_defaults(handler=test.run)

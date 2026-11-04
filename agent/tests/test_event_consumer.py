@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pytest
+from redis.exceptions import ResponseError
+
 from ssv_agent.config import SsvConfig
 from ssv_agent.dedup import _track_key
 from ssv_agent.event_consumer import EventConsumer
@@ -203,6 +206,29 @@ def test_ensure_group_creates_stream_group(monkeypatch: Any) -> None:
     assert fake.created == [("ssv:events", "ssv-agent", "0", True)]
 
 
+def test_ensure_group_ignores_only_existing_group(monkeypatch: Any) -> None:
+    fake = FakeRedis()
+    fake.xgroup_create = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        ResponseError("BUSYGROUP Consumer Group name already exists")
+    )
+    monkeypatch.setattr("ssv_agent.event_consumer.Redis", lambda **_kwargs: fake)
+    consumer = EventConsumer(SsvConfig())
+
+    consumer._ensure_group()
+
+
+def test_ensure_group_propagates_non_busy_errors(monkeypatch: Any) -> None:
+    fake = FakeRedis()
+    fake.xgroup_create = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        ResponseError("NOPERM command not allowed")
+    )
+    monkeypatch.setattr("ssv_agent.event_consumer.Redis", lambda **_kwargs: fake)
+    consumer = EventConsumer(SsvConfig())
+
+    with pytest.raises(ResponseError, match="NOPERM"):
+        consumer._ensure_group()
+
+
 def test_handle_event_parses_detection_and_acks(
     monkeypatch: Any,
     tmp_path: Path,
@@ -334,12 +360,26 @@ def test_dedup_skip_updates_episode_and_terminal_event_creates_one_extract_job(
     assert len(jobs) == 1
 
 
-def test_handle_event_acks_malformed_json(monkeypatch: Any) -> None:
+def test_handle_event_acks_malformed_json_without_logging_payload(monkeypatch: Any) -> None:
     consumer, fake = make_consumer(monkeypatch)
+    entries: list[tuple[str, dict[str, object]]] = []
 
-    consumer.handle_event("123-0", {"event": "{"})
+    class FakeLogger:
+        def warning(self, event: str, **fields: object) -> None:
+            entries.append((event, fields))
+
+    payload = '{"token":"sensitive-payload"'
+    monkeypatch.setattr("ssv_agent.event_consumer.logger", FakeLogger())
+    consumer.handle_event("123-0", {"event": payload})
 
     assert fake.acked == [("ssv:events", "ssv-agent", "123-0")]
+    assert entries == [
+        (
+            "malformed event, acking",
+            {"msg_id": "123-0", "payload_length": len(payload)},
+        )
+    ]
+    assert "sensitive-payload" not in repr(entries)
 
 
 def test_successful_record_acks_without_waiting_for_evidence_worker(
@@ -369,26 +409,73 @@ def test_successful_record_acks_without_waiting_for_evidence_worker(
 def test_ledger_failure_leaves_valid_message_pending(
     monkeypatch: Any,
 ) -> None:
-    fake_ledger = RecordingLedger(OSError("disk full"))
+    fake_ledger = RecordingLedger(OSError("private path /tmp/secret.db"))
     fake = FakeRedis()
+    entries: list[tuple[str, dict[str, object]]] = []
+
+    class FakeLogger:
+        def error(self, event: str, **fields: object) -> None:
+            entries.append((event, fields))
+
+    monkeypatch.setattr("ssv_agent.event_consumer.logger", FakeLogger())
     monkeypatch.setattr("ssv_agent.event_consumer.Redis", lambda **_kwargs: fake)
     consumer = EventConsumer(SsvConfig(), ledger_factory=lambda: fake_ledger)
 
-    consumer.handle_event(
-        "123-0",
+    payload = json.dumps(
         {
-            "event": json.dumps(
-                {
-                    "source": "camera-1",
-                    "frame_id": 42,
-                    "detections": [],
-                }
-            )
-        },
+            "source": "camera-1",
+            "frame_id": 42,
+            "detections": [],
+        }
     )
+    consumer.handle_event("123-0", {"event": payload})
 
     assert fake_ledger.records == []
     assert fake.acked == []
+    assert entries == [
+        (
+            "event ledger record failed; leaving Redis entry pending",
+            {
+                "event_id": "123-0",
+                "ingress_id": "123-0",
+                "payload_length": len(payload),
+                "error_type": "OSError",
+            },
+        )
+    ]
+    assert "private path" not in repr(entries)
+
+
+def test_invalid_event_logs_error_type_without_exception_text(monkeypatch: Any) -> None:
+    consumer, fake = make_consumer(monkeypatch)
+    entries: list[tuple[str, dict[str, object]]] = []
+
+    class FakeLogger:
+        def warning(self, event: str, **fields: object) -> None:
+            entries.append((event, fields))
+
+    def invalid_event(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("sensitive event details")
+
+    monkeypatch.setattr("ssv_agent.event_consumer.logger", FakeLogger())
+    monkeypatch.setattr(
+        "ssv_agent.event_consumer.ReviewContext.from_event", invalid_event
+    )
+    payload = json.dumps({"source": "camera-1"})
+    consumer.handle_event("123-0", {"event": payload})
+
+    assert fake.acked == [("ssv:events", "ssv-agent", "123-0")]
+    assert entries == [
+        (
+            "invalid event, acking",
+            {
+                "msg_id": "123-0",
+                "payload_length": len(payload),
+                "error_type": "ValueError",
+            },
+        )
+    ]
+    assert "sensitive event details" not in repr(entries)
 
 
 def test_same_event_redelivery_after_ledger_failure_is_recorded_before_ack(

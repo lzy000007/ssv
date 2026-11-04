@@ -530,6 +530,22 @@ std::optional<SsvResolvedDisplayBackend> resolve_display_backend(
         "required GTK display backend is unavailable");
 }
 
+std::string resolve_display_encoder_factory(
+    std::optional<SsvResolvedDisplayBackend> display_backend,
+    const SsvHardwareCapabilities &capabilities)
+{
+    if (display_backend != SsvResolvedDisplayBackend::RtspClientSink)
+        return {};
+    for (const auto factory : kSoftwareEncoderFactories) {
+        if (capabilities.has_gstreamer_element(factory))
+            return std::string(factory);
+    }
+    fail_plan(
+        SsvExitCode::CapabilityUnavailable,
+        "capability.display",
+        "RTSP display backend requires an H.264 encoder");
+}
+
 std::vector<std::string> resolve_display_fallback_reasons(
     const SsvDisplayConfig &display,
     const SsvCapabilitySnapshot &capabilities,

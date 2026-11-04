@@ -113,10 +113,10 @@ class RedisAdminTest(unittest.TestCase):
             ],
         )
 
-    def test_dry_run_reports_runtime_cache_without_deleting(self) -> None:
+    def test_dry_run_reports_runtime_state_without_deleting(self) -> None:
         redis = FakeRedis([42, [2, "1-0", "1-0", 1], ["0", ["ssv:agent:dedup:key"]]])
         admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent")
-        result = admin.clear_runtime_cache(dry_run=True)
+        result = admin.reset_runtime_state(dry_run=True)
         self.assertEqual(result.stream_entries_before, 42)
         self.assertEqual(result.pending_before, 2)
         self.assertEqual(result.dedup_keys_before, 1)
@@ -132,7 +132,7 @@ class RedisAdminTest(unittest.TestCase):
             ],
         )
 
-    def test_clear_runtime_cache_deletes_stream_and_dedup_keys_in_batches(self) -> None:
+    def test_reset_runtime_state_deletes_stream_and_dedup_keys_in_batches(self) -> None:
         redis = FakeRedis(
             [
                 5,
@@ -164,7 +164,7 @@ class RedisAdminTest(unittest.TestCase):
             consumer_group="ssv-agent",
             batch_size=2,
         )
-        result = admin.clear_runtime_cache()
+        result = admin.reset_runtime_state()
         self.assertEqual(result.stream_entries_before, 5)
         self.assertEqual(result.pending_before, 3)
         self.assertEqual(result.dedup_keys_before, 3)
@@ -185,10 +185,10 @@ class RedisAdminTest(unittest.TestCase):
         self.assertNotIn(("DEL", "other:key"), redis.commands)
         self.assertFalse(any("other:key" in command for command in redis.commands))
 
-    def test_empty_runtime_cache_reports_zero_deletions(self) -> None:
+    def test_empty_runtime_state_reports_zero_deletions(self) -> None:
         redis = FakeRedis([0, [0, "", "", 0], ["0", []], 0, ["0", []]])
         admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent")
-        result = admin.clear_runtime_cache()
+        result = admin.reset_runtime_state()
         self.assertEqual(result.stream_deleted, 0)
         self.assertEqual(result.dedup_deleted, 0)
         self.assertEqual(
@@ -227,7 +227,7 @@ class RedisAdminTest(unittest.TestCase):
         )
         admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent", batch_size=2)
         with self.assertRaises(RedisCleanupError) as raised:
-            admin.clear_runtime_cache()
+            admin.reset_runtime_state()
         self.assertEqual(raised.exception.result.stream_entries_before, 2)
         self.assertEqual(raised.exception.result.pending_before, 2)
         self.assertEqual(raised.exception.result.dedup_keys_before, 3)

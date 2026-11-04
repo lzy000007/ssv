@@ -223,7 +223,7 @@ class RedisAdmin:
             dedup_keys=self.dedup_key_count(),
         )
 
-    def clear_runtime_cache(self, *, dry_run: bool = False) -> RedisCleanupResult:
+    def reset_runtime_state(self, *, dry_run: bool = False) -> RedisCleanupResult:
         state = self.status()
         progress = _CleanupProgress(
             stream_entries_before=state.stream_length,

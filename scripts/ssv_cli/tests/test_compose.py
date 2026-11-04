@@ -8,10 +8,10 @@ from unittest.mock import MagicMock, patch
 
 from scripts.ssv_cli.config import RedisSettings
 from scripts.ssv_cli.context import ProjectContext
-from scripts.ssv_cli.services.compose import start_redis
+from scripts.ssv_cli.services.compose import start_infrastructure, status_infrastructure
 
 
-class ComposeRedisTest(unittest.TestCase):
+class ComposeInfrastructureTest(unittest.TestCase):
     def test_start_passes_resolved_redis_port_to_compose(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -34,7 +34,7 @@ class ComposeRedisTest(unittest.TestCase):
                 patch("scripts.ssv_cli.services.compose._qdrant_ready", return_value=True) as ready,
             ):
                 self.assertEqual(
-                    start_redis(context, settings, qdrant_url="http://localhost:7444"),
+                    start_infrastructure(context, settings, qdrant_url="http://localhost:7444"),
                     0,
                 )
 
@@ -49,6 +49,26 @@ class ComposeRedisTest(unittest.TestCase):
                 },
             )
             ready.assert_called_once_with(7444)
+
+    def test_status_prints_compose_service_state(self) -> None:
+        root = Path("/repo")
+        context = ProjectContext(
+            root=root,
+            environment={"PATH": "/usr/bin"},
+            config_path=None,
+            build_dir=root / "build",
+            compose_file=root / "docker" / "compose.yaml",
+        )
+        compose_result = subprocess.CompletedProcess([], 0, "ssv-redis Up\nssv-qdrant Up", "")
+
+        with (
+            patch("scripts.ssv_cli.services.compose._compose", return_value=compose_result) as compose,
+            patch("scripts.ssv_cli.services.compose.info") as output,
+        ):
+            self.assertEqual(status_infrastructure(context), 0)
+
+        compose.assert_called_once_with(context, "ps", capture_output=True)
+        output.assert_called_once_with("ssv-redis Up\nssv-qdrant Up")
 
 
 if __name__ == "__main__":

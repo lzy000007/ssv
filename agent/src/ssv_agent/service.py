@@ -104,6 +104,8 @@ class AgentService:
         self._qdrant_factory = qdrant_factory
         self._stopping = Event()
         self._lifecycle_lock = Lock()
+        self._background_failure_lock = Lock()
+        self._background_failure: tuple[str, str | None] | None = None
         self._consumer: EventConsumer | None = None
         self._consumer_thread: Thread | None = None
         self._worker_threads: list[Thread] = []
@@ -161,13 +163,31 @@ class AgentService:
                 raise
 
     def wait(self) -> None:
-        """等待消费线程结束；worker 的退出由 ``stop`` 统一管理。"""
-        if self._consumer_thread is not None:
-            self._consumer_thread.join()
+        """等待 consumer 退出，并在后台线程失败时尽快返回。"""
+        consumer_thread = self._consumer_thread
+        while consumer_thread is not None and consumer_thread.is_alive():
+            consumer_thread.join(timeout=0.1)
+            with self._background_failure_lock:
+                if self._background_failure is not None:
+                    break
+
+        with self._background_failure_lock:
+            failure = self._background_failure
+        if failure is None:
+            return
+        thread_name, error_type = failure
+        if error_type is None:
+            raise RuntimeError(
+                f"Agent background thread {thread_name} exited unexpectedly"
+            )
+        raise RuntimeError(
+            f"Agent background thread {thread_name} failed with {error_type}"
+        )
 
     def request_stop(self) -> None:
         """停止新的 ingress 与任务领取，但不触碰仍可能被 worker 使用的资源。"""
-        self._stopping.set()
+        with self._background_failure_lock:
+            self._stopping.set()
         consumer = self._consumer
         if consumer is not None:
             consumer.stop()
@@ -443,7 +463,12 @@ class AgentService:
     def _start_worker_thread(self, name: str, run: Callable[[Event], None]) -> None:
         if self._stopping.is_set():
             return
-        thread = Thread(target=run, args=(self._stopping,), name=name, daemon=True)
+        thread = Thread(
+            target=self._run_background_thread,
+            args=(name, run),
+            name=name,
+            daemon=True,
+        )
         if self._stopping.is_set():
             return
         self._worker_threads.append(thread)
@@ -453,7 +478,58 @@ class AgentService:
 
     def _run_consumer(self, consumer: EventConsumer) -> None:
         if not self._stopping.is_set():
-            consumer.start()
+            self._run_background_thread(
+                "ssv-agent-consumer",
+                lambda _stopping: consumer.start(),
+            )
+
+    def _run_background_thread(
+        self,
+        name: str,
+        run: Callable[[Event], None],
+    ) -> None:
+        try:
+            run(self._stopping)
+        except BaseException as exc:
+            self._record_background_failure(name, type(exc).__name__)
+        else:
+            if not self._stopping.is_set():
+                self._record_background_failure(name, None)
+
+    def _record_background_failure(
+        self,
+        name: str,
+        error_type: str | None,
+    ) -> None:
+        with self._background_failure_lock:
+            if self._background_failure is not None:
+                return
+            if error_type is None and self._stopping.is_set():
+                return
+            self._background_failure = (name, error_type)
+            self._stopping.set()
+
+        if error_type is None:
+            logger.error(
+                "agent background thread exited unexpectedly",
+                thread=name,
+            )
+        else:
+            logger.error(
+                "agent background thread failed",
+                thread=name,
+                error_type=error_type,
+            )
+
+        consumer = self._consumer
+        if consumer is not None:
+            try:
+                consumer.stop()
+            except BaseException as exc:
+                logger.warning(
+                    "agent consumer stop after background thread failure failed",
+                    error_type=type(exc).__name__,
+                )
 
 
 def run(config: SsvConfig) -> None:

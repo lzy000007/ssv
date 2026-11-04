@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 from collections.abc import Callable
 from pathlib import Path
 from threading import Event, Lock, Thread
+from time import monotonic
 
 import structlog
 
@@ -44,6 +46,57 @@ LedgerFactory = Callable[[], EventLedger]
 ReviewRunner = Callable[[ReviewContext], str]
 ResultWriter = Callable[[str, ReviewResult], Path]
 QdrantFactory = Callable[[], SsvQdrantStore]
+
+
+def _retrieval_chunk_observation(chunk: object) -> dict[str, object]:
+    metadata = getattr(chunk, "metadata", {}) or {}
+    return {
+        "chunk_id": str(getattr(chunk, "chunk_id", "")),
+        "score": getattr(chunk, "score", None),
+        "source": str(metadata.get("source", "")),
+        "rule_id": str(metadata.get("rule_id", "")),
+        "rule_version": str(metadata.get("rule_version", "")),
+        "section": str(metadata.get("section", "")),
+    }
+
+
+def _retrieval_failure_code(result: RetrievalResult) -> str | None:
+    if result.success:
+        return None
+    message = (result.error_message or "").lower()
+    if "rule vector index does not exist" in message:
+        return "rule_index_missing"
+    if "rule vector index is empty" in message:
+        return "rule_index_empty"
+    return "retrieval_failed"
+
+
+def _log_rule_retrieval(
+    *,
+    event_id: str,
+    job_id: int,
+    entity_revision: int,
+    query: str,
+    result: RetrievalResult,
+    started_at: float,
+    error_type: str | None = None,
+) -> None:
+    logger.info(
+        "rule retrieval observed",
+        event_id=event_id,
+        job_id=job_id,
+        entity_revision=entity_revision,
+        query_sha256=hashlib.sha256(query.encode("utf-8")).hexdigest(),
+        query_length=len(query),
+        backend=result.backend,
+        success=result.success,
+        available=result.success and bool(result.chunks),
+        chunk_count=len(result.chunks),
+        chunks=[_retrieval_chunk_observation(chunk) for chunk in result.chunks],
+        retrieval_ms=max(0, int((monotonic() - started_at) * 1000)),
+        error_type=error_type,
+        failure_code=_retrieval_failure_code(result),
+    )
 
 
 class _HeartbeatError(RuntimeError):
@@ -244,7 +297,7 @@ class _PollingWorker:
                 stopping.wait(self._poll_interval_seconds)
 
     def _poll_error(self, exc: Exception) -> str:
-        return str(exc)
+        return type(exc).__name__
 
 
 class ReviewWorker(_PollingWorker):
@@ -320,6 +373,8 @@ class ReviewWorker(_PollingWorker):
                 )
                 if self._rule_retriever is not None:
                     filters = build_rule_filters(case)
+                    retrieval_started = monotonic()
+                    retrieval_error_type: str | None = None
                     try:
                         retrieval = self._rule_retriever.retrieve(
                             query,
@@ -329,12 +384,22 @@ class ReviewWorker(_PollingWorker):
                         if inspect.isawaitable(retrieval):
                             retrieval = asyncio.run(retrieval)
                     except Exception as exc:
+                        retrieval_error_type = type(exc).__name__
                         retrieval = RetrievalResult(
                             query=query,
-                            backend="",
+                            backend=getattr(self._rule_retriever, "backend_name", "unknown"),
                             success=False,
-                            error_message=type(exc).__name__,
+                            error_message=retrieval_error_type,
                         )
+                    _log_rule_retrieval(
+                        event_id=case.event_id,
+                        job_id=job.job_id,
+                        entity_revision=job.entity_revision,
+                        query=query,
+                        result=retrieval,
+                        started_at=retrieval_started,
+                        error_type=retrieval_error_type,
+                    )
                 rule_context = RuleRetrievalContext.from_result(query, retrieval)
                 try:
                     try:
@@ -411,7 +476,7 @@ class ReviewWorker(_PollingWorker):
                         event_id=job.entity_id,
                         job_id=job.job_id,
                         state=state.value,
-                        error=str(exc),
+                        error_type=type(exc).__name__,
                     )
             finally:
                 _stop_heartbeat(heartbeat)
@@ -542,7 +607,7 @@ class RecordingEvidenceWorker(_PollingWorker):
                         event_id=job.entity_id,
                         job_id=job.job_id,
                         state=state.value,
-                        error=type(exc).__name__,
+                        error_type=type(exc).__name__,
                     )
             finally:
                 _stop_heartbeat(heartbeat)
@@ -654,7 +719,7 @@ class IndexWorker(_PollingWorker):
                         event_id=job.entity_id,
                         job_id=job.job_id,
                         state=state.value,
-                        error=str(exc),
+                        error_type=type(exc).__name__,
                     )
             finally:
                 _stop_heartbeat(heartbeat)
@@ -792,7 +857,7 @@ class ReportWorker(_PollingWorker):
                         event_id=job.entity_id,
                         job_id=job.job_id,
                         state=state.value,
-                        error=str(exc),
+                        error_type=type(exc).__name__,
                     )
             finally:
                 _stop_heartbeat(heartbeat)

@@ -49,7 +49,7 @@ spec 和 plan 使用中文；代码标识、命令、路径、配置键保持英
 
 已经具备：
 
-- `./ssv build` / `./ssv clean` / `./ssv test` / `./ssv run` / `./ssv run --display` / `./ssv agent` / `./ssv redis start` / `./ssv redis stop` / `./ssv inspect` / `./ssv model ...`。
+- `./ssv build` / `./ssv clean` / `./ssv test` / `./ssv run` / `./ssv run --display` / `./ssv agent` / `./ssv infra start|stop|status` / `./ssv runtime status|reset` / `./ssv inspect` / `./ssv model ...`。
 - Meson 构建输出目录固定为 `build`。
 - GStreamer C++ 插件构建基线：`ssv-template`、`ssv-infer`、`ssv-track`、`ssv-pub`、`ssv-overlay`、`ssv-common`。
 - Python Agent 服务、配置加载、Redis Streams 消费基线。
