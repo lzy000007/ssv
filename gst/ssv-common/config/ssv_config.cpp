@@ -559,11 +559,19 @@ void validate_review_extension(const YAML::Node &node)
         "retry_delay_ms",
         "policy_id",
         "model_id",
+        "recursion_limit",
     });
     validate_worker_common(node, path);
     static_cast<void>(get_or<std::string>(
         node, "policy_id", "ssv-review.v1", "agent.review.policy_id"));
     validate_optional_string_field(node, "model_id", "agent.review.model_id");
+    if (const auto recursion_limit = node["recursion_limit"]) {
+        constexpr std::string_view limit_path = "agent.review.recursion_limit";
+        if (node_as<int>(recursion_limit, limit_path) <= 0) {
+            throw_invalid_value(limit_path,
+                "agent.review.recursion_limit must be positive");
+        }
+    }
 }
 
 void validate_indexing_extension(const YAML::Node &node)

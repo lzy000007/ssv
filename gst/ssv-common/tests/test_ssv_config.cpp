@@ -447,6 +447,45 @@ agent:
         "agent.web.host");
 }
 
+void test_review_recursion_limit_contract()
+{
+    const std::string prefix = R"yaml(version: "2.0"
+sources:
+  - id: "camera-01"
+    uri: "rtsp://127.0.0.1/test"
+agent:
+  review:
+)yaml";
+    for (const auto enabled : { "false", "true" }) {
+        const auto section = prefix + "    enabled: " + enabled + "\n";
+        for (const auto setting : {
+                 "",
+                 "    recursion_limit: 1\n",
+                 "    recursion_limit: 256\n",
+                 "    recursion_limit: 384\n",
+             }) {
+            ScopedConfigEnvironment environment;
+            const auto path = environment.write(
+                "review-recursion-limit.yaml", section + setting);
+            static_cast<void>(ssv::ssv_config_load(path.string()));
+        }
+
+        for (const auto value : { "0", "-1" }) {
+            expect_config_error(
+                section + "    recursion_limit: " + value + "\n",
+                ssv::SsvConfigErrorKind::InvalidValue,
+                "agent.review.recursion_limit");
+        }
+        for (const auto value : {
+                 "true", "256.0", "\"256\"", "null", "[]", "{}" }) {
+            expect_config_error(
+                section + "    recursion_limit: " + value + "\n",
+                ssv::SsvConfigErrorKind::InvalidType,
+                "agent.review.recursion_limit");
+        }
+    }
+}
+
 void test_rejects_invalid_reporting_worker_settings()
 {
     struct Case {
@@ -2139,6 +2178,7 @@ int main(int argc, char **argv)
     test_loads_rtsp_encoded_passthrough_config();
     test_loads_example_config(argv[1]);
     test_accepts_shared_agent_config_fields();
+    test_review_recursion_limit_contract();
     test_rejects_invalid_reporting_worker_settings();
     test_evidence_cache_rejects_invalid_values();
     test_rejects_invalid_event_db_path();

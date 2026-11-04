@@ -285,6 +285,8 @@ agent:
 
 `agent.review.recursion_limit` 限制一次复核的 LangGraph 节点执行步数，包括模型、工具和中间件节点；它不是 Python 调用栈深度、模型请求次数、token 或秒数。SSV 显式使用默认 256，避免 DeerFlow 默认 100 步在正常逐帧取证流程中过早耗尽。达到上限会记录 `review_step_limit_exceeded`，不采用中间输出；任务继续遵循已有重试策略。排查时先检查工具是否重复调用，再根据正常取证所需轮次调整配置；runner 不会自动放宽上限。此设置不改变 DeerFlow 的循环检测、结果校验和租约机制。
 
+原生 runner 同样接受并校验这个共享配置字段，即使 `agent.review.enabled=false`，显式值也必须为 YAML 正整数；字符串、布尔值、浮点数、null 和非正数会在启动前被拒绝。省略时仍由 Python Agent 使用默认值 256，原生 runner 不持有或使用该执行预算。
+
 启用前检查：
 
 1. `agent/config.yaml` 中存在 `evidence_reader`、`get_event`、`get_report`、`sample_video`、`search_events`、`rule_retriever` 六个配置工具。
